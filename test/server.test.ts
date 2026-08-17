@@ -37,6 +37,10 @@ describe("server plugin", () => {
     expect(REVIEWER_SYSTEM_PROMPT).toContain("Treat direct continuation phrases")
     expect(REVIEWER_SYSTEM_PROMPT).toContain("later explicit human authorization")
     expect(REVIEWER_SYSTEM_PROMPT).toContain("do not treat the boundary glob as the intended scope")
+    expect(REVIEWER_SYSTEM_PROMPT).toContain("Apply context.agentMode")
+    expect(REVIEWER_SYSTEM_PROMPT).toContain("In plan mode, ALLOW only actions that are genuinely read-only")
+    expect(REVIEWER_SYSTEM_PROMPT).toContain("DENY any action that violates the plan-mode read-only boundary")
+    expect(REVIEWER_SYSTEM_PROMPT).toContain("In edit mode, ALLOW ordinary inspection")
   })
 
   test("registers the hidden reviewer agent through the beta config hook", async () => {

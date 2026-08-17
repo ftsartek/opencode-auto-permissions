@@ -9,6 +9,7 @@ describe("parseConfig", () => {
       variant: undefined,
       timeoutMs: 30_000,
       userMessageCount: 8,
+      readOnlyAgents: ["plan"],
       shadow: false,
       sessionApprovals: true,
       runtime: "auto",
@@ -55,6 +56,15 @@ describe("parseConfig", () => {
   test("allows session approvals to be disabled", () => {
     expect(parseConfig({ model: "a/b" }).sessionApprovals).toBeTrue()
     expect(parseConfig({ model: "a/b", sessionApprovals: false }).sessionApprovals).toBeFalse()
+  })
+
+  test("adds configured read-only agents to the built-in plan agent", () => {
+    expect(parseConfig({ readOnlyAgents: ["review-only", "plan", " review-only "] }).readOnlyAgents).toEqual([
+      "plan",
+      "review-only",
+    ])
+    expect(() => parseConfig({ readOnlyAgents: "review-only" })).toThrow(/readOnlyAgents/)
+    expect(() => parseConfig({ readOnlyAgents: [""] })).toThrow(/readOnlyAgents/)
   })
 
   test("enables bounded diagnostics with a default or explicit path", () => {

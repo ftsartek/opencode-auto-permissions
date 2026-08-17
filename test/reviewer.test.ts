@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { installReviewer } from "../src/reviewer.ts"
 import type { PermissionRequest, ReviewerClient, RuntimeContext } from "../src/types.ts"
 
-function harness(options: Record<string, unknown> = { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731" }) {
+function harness(
+  options: Record<string, unknown> = { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731" },
+  agent = "build",
+) {
   const handlers = new Map<string, Set<(event: unknown) => void>>()
   const requests: PermissionRequest[] = []
   const replies: Parameters<ReviewerClient["reply"]>[0][] = []
@@ -38,7 +41,7 @@ function harness(options: Record<string, unknown> = { model: "cloudflare-workers
                 id: "msg_assistant",
                 type: "assistant",
                 time: { created: 2 },
-                agent: "build",
+                agent,
                 model: { providerID: "example", id: "main" },
                 content: [
                   {
@@ -59,7 +62,7 @@ function harness(options: Record<string, unknown> = { model: "cloudflare-workers
                   id: "msg_assistant",
                   type: "assistant",
                   time: { created: 2 },
-                  agent: "build",
+                  agent,
                   model: { providerID: "example", id: "main" },
                   content: [
                     {
@@ -273,6 +276,35 @@ describe("installReviewer", () => {
     dispose()
   })
 
+  test("sends write-capable commands from a configured plan agent to the reviewer", async () => {
+    const app = harness(
+      {
+        model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+        readOnlyAgents: ["review-only"],
+      },
+      "review-only",
+    )
+    let prompt = ""
+    app.client.generate = async (input) => {
+      prompt = input.prompt
+      return {
+        decision: "deny",
+        reasonCode: "plan_mode_write",
+        reason: "This command may write files; use a read-only alternative or switch to edit mode.",
+      }
+    }
+    app.requests.push(request("pnpm test"))
+    const dispose = installReviewer(app.context, { client: app.client })
+
+    app.emit("permission.v2.asked", app.requests[0])
+    await settle()
+
+    expect(prompt).toContain('"agent":"review-only"')
+    expect(prompt).toContain('"agentMode":"plan"')
+    expect(app.replies[0]?.reply).toBe("reject")
+    dispose()
+  })
+
   test("reviews permission actions outside shell and external directory", async () => {
     const app = harness()
     app.client.generate = async () => ({ decision: "allow", reasonCode: "requested_read", reason: "Reads a project file." })
@@ -292,11 +324,11 @@ describe("installReviewer", () => {
     const app = harness()
     app.client.generate = async () => ({
       decision: "allow_session",
-      reasonCode: "repeatable_fetch",
-      reason: "Fetching this remote is a repeatable low-risk operation.",
+      reasonCode: "repeatable_read",
+      reason: "Reading this project file is a repeatable low-risk operation.",
     })
-    const pending = request("git fetch origin")
-    pending.always = ["git fetch origin*"]
+    const pending = toolRequest("read", "src/index.ts")
+    pending.always = ["src/index.ts"]
     app.requests.push(pending)
     const dispose = installReviewer(app.context, { client: app.client })
 
@@ -314,17 +346,18 @@ describe("installReviewer", () => {
     let reviews = 0
     app.client.generate = async () => {
       reviews++
-      return { decision: "allow", reasonCode: "approved_fetch", reason: "The fetch is approved." }
+      return { decision: "allow", reasonCode: "approved_read", reason: "The read is approved." }
     }
-    const first = request("git fetch origin", "v2", "per_1")
-    first.always = ["git fetch origin*"]
+    const first = toolRequest("read", "src/index.ts")
+    first.always = ["src/*.ts"]
     app.requests.push(first)
     const dispose = installReviewer(app.context, { client: app.client })
 
     app.emit("permission.v2.asked", first)
     await settle()
-    const second = request("git fetch origin main", "v2", "per_2")
-    second.always = ["git fetch origin*"]
+    const second = toolRequest("read", "src/policy.ts")
+    second.id = "per_2"
+    second.always = ["src/*.ts"]
     app.requests.push(second)
     app.emit("permission.v2.asked", second)
     await settle()
@@ -362,6 +395,7 @@ describe("installReviewer", () => {
 
   test.each([
     { command: "git push origin feature", always: ["git push origin feature"] },
+    { command: "git fetch origin", always: ["git fetch origin"] },
     { command: "git fetch origin", always: ["*"] },
     { command: "git fetch origin", always: ["git *"] },
   ])("downgrades ineligible session approval for $command", async ({ command, always }) => {

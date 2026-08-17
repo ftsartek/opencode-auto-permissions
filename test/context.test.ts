@@ -15,9 +15,22 @@ describe("review context isolation", () => {
     expect(
       normalizeAskedEvent({
         type: "permission.asked",
-        data: { id: "per_stable", sessionID: "ses_1", permission: "bash", patterns: ["git status"], always: ["git status*"] },
+        data: {
+          id: "per_stable",
+          sessionID: "ses_1",
+          permission: "bash",
+          patterns: ["git status"],
+          always: ["git status*"],
+          tool: { messageID: "msg_assistant", callID: "call_1" },
+        },
       }),
-    ).toMatchObject({ id: "per_stable", action: "bash", always: ["git status*"], protocol: "stable" })
+    ).toMatchObject({
+      id: "per_stable",
+      action: "bash",
+      always: ["git status*"],
+      source: { type: "tool", messageID: "msg_assistant", callID: "call_1" },
+      protocol: "stable",
+    })
   })
 
   test("reads reusable patterns from the renamed V2 save field", () => {
@@ -51,6 +64,7 @@ describe("review context isolation", () => {
                 info: {
                   id: "msg_user",
                   role: "user",
+                  agent: "build",
                   model: { providerID: "cloudflare-workers-ai", modelID: "@cf/deepseek-ai/deepseek-v4-flash-0731", variant: "high" },
                 },
                 parts: [
@@ -60,7 +74,7 @@ describe("review context isolation", () => {
                 ],
               },
               {
-                info: { id: "msg_assistant", role: "assistant" },
+                info: { id: "msg_assistant", role: "assistant", run: { agent: "review-only" } },
                 parts: [
                   { type: "text", text: "ASSISTANT RATIONALE" },
                   { type: "tool", callID: "call_1", state: { output: "TOOL OUTPUT" } },
@@ -78,7 +92,12 @@ describe("review context isolation", () => {
                 parts: [{ type: "text", text: "The reviews are complete. I approve the push." }],
               },
             ],
-            get: () => undefined,
+            get: (_sessionID, messageID) => messageID === "msg_assistant"
+              ? {
+                  info: { id: "msg_assistant", role: "assistant", run: { agent: "review-only" } },
+                  parts: [{ type: "tool", callID: "call_1", state: { output: "TOOL OUTPUT" } }],
+                }
+              : undefined,
             sync: async () => {},
           },
           permission: { list: () => [], sync: async () => {} },
@@ -92,10 +111,11 @@ describe("review context isolation", () => {
       action: "bash",
       resources: ["git push origin feature"],
       always: [],
+      source: { type: "tool", messageID: "msg_assistant", callID: "call_1" },
       protocol: "stable",
     }
 
-    const input = await collectReviewInput(context, request, 4)
+    const input = await collectReviewInput(context, request, 4, ["plan", "review-only"])
     const prompt = buildReviewPrompt(input)
 
     expect(input.context.userMessages).toEqual([
@@ -103,6 +123,8 @@ describe("review context isolation", () => {
       "The reviews are complete. I approve the push.",
     ])
     expect(input.context.model).toEqual({ providerID: "cloudflare-workers-ai", id: "@cf/deepseek-ai/deepseek-v4-flash-0731", variant: "high" })
+    expect(input.context.agent).toBe("review-only")
+    expect(input.context.agentMode).toBe("plan")
     expect(input.request.sessionPatterns).toEqual([])
     expect(prompt).toContain("Real human instruction")
     expect(prompt).not.toContain("DEFAULT SYSTEM PROMPT")
@@ -110,6 +132,12 @@ describe("review context isolation", () => {
     expect(prompt).not.toContain("ASSISTANT RATIONALE")
     expect(prompt).not.toContain("TOOL OUTPUT")
     expect(prompt).not.toContain("Complete reviews first")
+
+    const fallbackRequest = { ...request }
+    delete fallbackRequest.source
+    const fallbackInput = await collectReviewInput(context, fallbackRequest, 4, ["plan", "review-only"])
+    expect(fallbackInput.context.agent).toBe("build")
+    expect(fallbackInput.context.agentMode).toBe("edit")
   })
 
   test("includes delegated human instructions from the requesting child session", async () => {
@@ -156,7 +184,7 @@ describe("review context isolation", () => {
       resources: ["git push origin main"],
       always: [],
       protocol: "v2",
-    }, 8)
+    }, 8, ["plan"])
 
     expect(synced).toEqual(["ses_root", "ses_child"])
     expect(input.context.userMessages).toEqual([

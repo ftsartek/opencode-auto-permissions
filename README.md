@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-108%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-112%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -83,6 +83,7 @@ For each supported permission request, Auto Permissions combines deterministic s
 - External-directory boundaries are not treated as sensitive by default: ordinary project, tool, cache, log, state, temporary, and worktree paths are approved unless the target or operation presents a concrete hazard.
 - Broad boundary globs such as `/tmp/*` are not treated as the requested scope when the tool input identifies a precise target; the reviewer evaluates the actual operation and latest user request.
 - The reviewer is tuned for unattended agents: it defaults to approval when an action reasonably serves the task and uses `ask` only as a last resort.
+- The reviewer receives the requesting agent's mode. Plan agents are restricted to genuinely read-only actions, while edit/build agents use the regular development workflow; requests with no detectable agent use the conservative plan policy.
 - If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step.
 - Reviewer sessions are hidden, have no tools, and deny all permissions.
 - Only a small, recent window of relevant user context is sent for review.
@@ -98,9 +99,9 @@ Denial and failure continuations preserve the main session's selected agent, mod
 
 ### Session Approvals
 
-For repeatable low-risk operations, the reviewer may choose `allow_session`. The plugin then uses OpenCode's own tool-provided `always` patterns, so future matching requests in that session bypass another model call. It never invents or broadens a permission pattern.
+For repeatable low-risk read and search operations, the reviewer may choose `allow_session`. The plugin then uses OpenCode's own tool-provided `always` patterns, so future matching requests in that session bypass another model call. It never invents or broadens a permission pattern.
 
-Code-side guardrails downgrade `allow_session` to a one-time approval when patterns are missing or broad, or when the action involves edits, external-directory boundaries, `sudo`, deletion, push, publish, deploy, credentials, destructive Git, or other non-repeatable effects. Eligible examples include narrow reads/searches and commands such as a specific `git fetch` or test invocation. Set `sessionApprovals: false` to force all model approvals to remain one-time.
+Code-side guardrails downgrade `allow_session` to a one-time approval when patterns are missing or broad, or when the action involves shell commands, edits, external-directory boundaries, or sensitive targets. Persistent shell approvals are never granted because OpenCode session permissions can outlive an agent-mode switch. Eligible examples are narrow reads, searches, listings, and LSP operations. Set `sessionApprovals: false` to force all model approvals to remain one-time.
 
 When an action is rejected, Auto Permissions returns the reason to the main agent and asks it to continue with a safer alternative when possible. For example, it can target a generated subdirectory instead of a broad recursive delete, use `--force-with-lease` instead of an unrestricted force push, or inspect a deployment plan before applying it. A denial should redirect useful work rather than end the session.
 
@@ -129,6 +130,7 @@ The plugin tuple accepts these options:
 | `sessionApprovals` | `true` | Reuse guarded, pattern-specific approvals immediately for the current session. Set `false` for one-time approvals only. |
 | `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
+| `readOnlyAgents` | `["plan"]` | Additional agent IDs that should use plan-mode read-only review. The built-in `plan` agent is always included. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |
@@ -148,7 +150,7 @@ Keep the entries in `~/.config/opencode/opencode.json` and, on older V2 betas th
 
 With `debug: true`, diagnostics are written to `$XDG_STATE_HOME/opencode/auto-permissions/decisions.jsonl` (normally `~/.local/state/opencode/auto-permissions/decisions.jsonl`). Records include action type, timing, verdict, reason, reply result, and failure category. Commands, paths, tool inputs, and conversation text are not logged.
 
-Access to this bounded diagnostics file is deterministically allowed by the plugin so troubleshooting cannot be blocked by speculative sensitivity concerns. This exception applies only to Auto Permissions' own `decisions.jsonl` path.
+In edit mode, access to this bounded diagnostics file is deterministically allowed by the plugin so troubleshooting cannot be blocked by speculative sensitivity concerns. In plan mode, access is reviewed under the read-only policy. The exception applies only to Auto Permissions' own `decisions.jsonl` path.
 
 Reviewer sessions are standalone rather than children of the active coding session. This keeps reviewer model and variant state isolated from the main agent and its displayed reasoning level.
 

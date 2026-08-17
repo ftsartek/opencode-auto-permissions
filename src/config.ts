@@ -3,6 +3,7 @@ import { defaultDiagnosticsPath } from "./diagnostics.ts"
 
 const DEFAULT_TIMEOUT_MS = 30_000
 const DEFAULT_USER_MESSAGE_COUNT = 8
+const DEFAULT_READ_ONLY_AGENTS = ["plan"]
 
 export interface Config {
   model: ReviewModel | undefined
@@ -10,6 +11,7 @@ export interface Config {
   variant: string | undefined
   timeoutMs: number
   userMessageCount: number
+  readOnlyAgents: string[]
   shadow: boolean
   sessionApprovals: boolean
   runtime: "auto" | "stable" | "v2"
@@ -33,11 +35,25 @@ export function parseConfig(options: Readonly<Record<string, unknown>>): Config 
       20,
       "userMessageCount",
     ),
+    readOnlyAgents: parseReadOnlyAgents(options.readOnlyAgents),
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
     runtime: parseRuntime(options.runtime),
     diagnosticsPath: parseDiagnosticsPath(options.debug),
   }
+}
+
+function parseReadOnlyAgents(value: unknown): string[] {
+  if (value === undefined) return [...DEFAULT_READ_ONLY_AGENTS]
+  if (!Array.isArray(value)) throw new Error("Auto Permissions readOnlyAgents must be an array of agent IDs")
+
+  const agents = value.map((agent) => {
+    if (typeof agent !== "string" || !agent.trim()) {
+      throw new Error("Auto Permissions readOnlyAgents must contain only non-empty agent IDs")
+    }
+    return agent.trim()
+  })
+  return [...new Set([...DEFAULT_READ_ONLY_AGENTS, ...agents])]
 }
 
 function parseModel(value: unknown, variant: string | undefined): ReviewModel | undefined {
