@@ -36,7 +36,7 @@ describe("review context isolation", () => {
     ).toMatchObject({ id: "per_v2_save", always: ["git fetch*"], protocol: "v2" })
   })
 
-  test("includes only real human text and excludes ambient or agent content", async () => {
+  test("includes human text and answered questions, excluding ambient or agent content", async () => {
     const context: RuntimeContext = {
       options: {},
       client: {},
@@ -64,6 +64,28 @@ describe("review context isolation", () => {
                 parts: [
                   { type: "text", text: "ASSISTANT RATIONALE" },
                   { type: "tool", callID: "call_1", state: { output: "TOOL OUTPUT" } },
+                  {
+                    type: "tool",
+                    callID: "call_2",
+                    tool: "question",
+                    state: {
+                      status: "completed",
+                      input: {
+                        questions: [
+                          { question: "Deploy after tests pass?" },
+                          { question: "UNANSWERED QUESTION" },
+                        ],
+                      },
+                      output: "User has answered your questions",
+                      metadata: { answers: [["Yes, deploy"], []] },
+                    },
+                  },
+                  {
+                    type: "tool",
+                    callID: "call_3",
+                    tool: "question",
+                    state: { status: "running", input: { questions: [{ question: "PENDING QUESTION" }] } },
+                  },
                 ],
               },
               {
@@ -72,6 +94,21 @@ describe("review context isolation", () => {
                   type: "text",
                   text: "[Auto Permissions] The requested action was blocked: Complete reviews first.",
                 }],
+              },
+              {
+                type: "assistant",
+                content: [
+                  {
+                    type: "tool",
+                    callID: "call_4",
+                    tool: "question",
+                    state: {
+                      status: "completed",
+                      input: { questions: [{ question: "Which environment?" }] },
+                      metadata: { answers: [["Staging"]] },
+                    },
+                  },
+                ],
               },
               {
                 info: { id: "msg_approval", role: "user" },
@@ -98,9 +135,11 @@ describe("review context isolation", () => {
     const input = await collectReviewInput(context, request, 4)
     const prompt = buildReviewPrompt(input)
 
-    expect(input.context.userMessages).toEqual([
-      "Real human instruction",
-      "The reviews are complete. I approve the push.",
+    expect(input.context.conversation).toEqual([
+      { kind: "user_message", text: "Real human instruction" },
+      { kind: "question_answer", question: "Deploy after tests pass?", answers: ["Yes, deploy"] },
+      { kind: "question_answer", question: "Which environment?", answers: ["Staging"] },
+      { kind: "user_message", text: "The reviews are complete. I approve the push." },
     ])
     expect(input.context.model).toEqual({ providerID: "cloudflare-workers-ai", id: "@cf/deepseek-ai/deepseek-v4-flash-0731", variant: "high" })
     expect(input.request.sessionPatterns).toEqual([])
@@ -110,6 +149,8 @@ describe("review context isolation", () => {
     expect(prompt).not.toContain("ASSISTANT RATIONALE")
     expect(prompt).not.toContain("TOOL OUTPUT")
     expect(prompt).not.toContain("Complete reviews first")
+    expect(prompt).not.toContain("UNANSWERED QUESTION")
+    expect(prompt).not.toContain("PENDING QUESTION")
   })
 
   test("includes delegated human instructions from the requesting child session", async () => {
@@ -159,9 +200,9 @@ describe("review context isolation", () => {
     }, 8)
 
     expect(synced).toEqual(["ses_root", "ses_child"])
-    expect(input.context.userMessages).toEqual([
-      "Implement the change and finish the task.",
-      "Push the completed branch to main.",
+    expect(input.context.conversation).toEqual([
+      { kind: "user_message", text: "Implement the change and finish the task." },
+      { kind: "user_message", text: "Push the completed branch to main." },
     ])
     expect(input.context.model).toEqual({ providerID: "kiro", id: "gpt-5.6-mini", variant: "low" })
   })
