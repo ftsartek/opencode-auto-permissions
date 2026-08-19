@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-112%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-116%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -84,6 +84,7 @@ For each supported permission request, Auto Permissions combines deterministic s
 - Broad boundary globs such as `/tmp/*` are not treated as the requested scope when the tool input identifies a precise target; the reviewer evaluates the actual operation and latest user request.
 - The reviewer is tuned for unattended agents: it defaults to approval when an action reasonably serves the task and uses `ask` only as a last resort.
 - The reviewer receives the requesting agent's mode. Plan agents are restricted to genuinely read-only actions, while edit/build agents use the regular development workflow; requests with no detectable agent use the conservative plan policy.
+- Set `enableAutoReadOnly: false` to opt plan-mode requests out of automatic review entirely: the plugin runs no deterministic policy or reviewer model and never replies, so OpenCode's own permission prompt appears instead. Edit-mode agents are unaffected.
 - If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step.
 - Reviewer sessions are hidden, have no tools, and deny all permissions.
 - Only a small, recent window of relevant user context is sent for review.
@@ -131,6 +132,7 @@ The plugin tuple accepts these options:
 | `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
 | `readOnlyAgents` | `["plan"]` | Additional agent IDs that should use plan-mode read-only review. The built-in `plan` agent is always included. |
+| `enableAutoReadOnly` | `true` | Automatically review permission requests from read-only (plan) agents, or requests with no detectable agent. Set `false` to leave those requests entirely to OpenCode's native permission prompt. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |

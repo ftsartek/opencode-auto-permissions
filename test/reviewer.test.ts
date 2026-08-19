@@ -305,6 +305,79 @@ describe("installReviewer", () => {
     dispose()
   })
 
+  test("abstains entirely for a plan-mode request when enableAutoReadOnly is false", async () => {
+    const app = harness(
+      { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731", enableAutoReadOnly: false },
+      "plan",
+    )
+    let generateCalls = 0
+    app.client.generate = async () => {
+      generateCalls++
+      return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+    }
+    app.requests.push(request("pnpm test"))
+    const abstained: PermissionRequest[] = []
+    const dispose = installReviewer(app.context, {
+      client: app.client,
+      onAbstain: (req) => abstained.push(req),
+    })
+
+    app.emit("permission.v2.asked", app.requests[0])
+    await settle()
+
+    expect(generateCalls).toBe(0)
+    expect(app.replies).toEqual([])
+    expect(app.toasts).toEqual([])
+    expect(app.requests).toHaveLength(1)
+    expect(abstained).toHaveLength(1)
+    dispose()
+  })
+
+  test("abstains for a stable-protocol plan-mode request when enableAutoReadOnly is false", async () => {
+    const app = harness(
+      { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731", enableAutoReadOnly: false },
+      "plan",
+    )
+    let generateCalls = 0
+    app.client.generate = async () => {
+      generateCalls++
+      return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+    }
+    const stable = request("git status", "stable")
+    app.requests.push(stable)
+    const dispose = installReviewer(app.context, { client: app.client })
+
+    app.emit("permission.asked", {
+      id: stable.id,
+      sessionID: stable.sessionID,
+      permission: "bash",
+      patterns: stable.resources,
+      metadata: {},
+      always: [],
+      tool: { messageID: "msg_assistant", callID: "call_1" },
+    })
+    await settle()
+
+    expect(generateCalls).toBe(0)
+    expect(app.replies).toEqual([])
+    expect(app.requests).toHaveLength(1)
+    dispose()
+  })
+
+  test("still reviews edit-mode agent requests when enableAutoReadOnly is false", async () => {
+    const app = harness({ enableAutoReadOnly: false })
+    app.requests.push(request("pnpm test"))
+    const dispose = installReviewer(app.context, { client: app.client })
+
+    app.emit("permission.v2.asked", app.requests[0])
+    await settle()
+
+    expect(app.replies).toEqual([
+      { sessionID: "ses_root", requestID: "per_1", reply: "once", protocol: "v2" },
+    ])
+    dispose()
+  })
+
   test("reviews permission actions outside shell and external directory", async () => {
     const app = harness()
     app.client.generate = async () => ({ decision: "allow", reasonCode: "requested_read", reason: "Reads a project file." })

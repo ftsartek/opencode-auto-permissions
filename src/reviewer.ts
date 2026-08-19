@@ -24,6 +24,7 @@ export interface ReviewerOverrides {
   protocols?: PermissionProtocol[]
   onDecision?(request: PermissionRequest, decision: Decision, shadow: boolean): void
   onFailure?(request: PermissionRequest, error: unknown): void
+  onAbstain?(request: PermissionRequest): void
 }
 
 export function installReviewer(context: RuntimeContext, overrides: ReviewerOverrides = {}): () => void {
@@ -116,6 +117,12 @@ async function reviewAndReply(
 ): Promise<void> {
   const input = await collectReviewInput(context, request, config.userMessageCount, config.readOnlyAgents)
   if (parentSignal.aborted) return
+
+  if (!config.enableAutoReadOnly && input.context.agentMode === "plan") {
+    overrides.onAbstain?.(request)
+    writeAbstained(config, request, startedAt)
+    return
+  }
 
   const policyDecision = applyDeterministicPolicy(input)
   const approvalKey = reusableApprovalKey(config, request, input)
@@ -302,6 +309,19 @@ function writeFailure(config: Config, request: PermissionRequest, startedAt: num
     ...(described.tag ? { errorTag: described.tag } : {}),
     ...(described.code !== undefined ? { errorCode: described.code } : {}),
     ...(described.status !== undefined ? { errorStatus: described.status } : {}),
+  })
+}
+
+function writeAbstained(config: Config, request: PermissionRequest, startedAt: number): void {
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    requestID: request.id,
+    sessionID: request.sessionID,
+    protocol: request.protocol,
+    action: request.action,
+    resourceCount: request.resources.length,
+    elapsedMs: Math.round(performance.now() - startedAt),
+    event: "abstained",
   })
 }
 

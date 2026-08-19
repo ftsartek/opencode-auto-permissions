@@ -409,6 +409,7 @@ function parseConfig(options) {
     timeoutMs: boundedInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS, 100, 30000, "timeoutMs"),
     userMessageCount: boundedInteger(options.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
     readOnlyAgents: parseReadOnlyAgents(options.readOnlyAgents),
+    enableAutoReadOnly: options.enableAutoReadOnly !== false,
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
     runtime: parseRuntime(options.runtime),
@@ -986,6 +987,11 @@ async function reviewAndReply(context, client, config, request, parentSignal, ov
   const input = await collectReviewInput(context, request, config.userMessageCount, config.readOnlyAgents);
   if (parentSignal.aborted)
     return;
+  if (!config.enableAutoReadOnly && input.context.agentMode === "plan") {
+    overrides.onAbstain?.(request);
+    writeAbstained(config, request, startedAt);
+    return;
+  }
   const policyDecision = applyDeterministicPolicy(input);
   const approvalKey = reusableApprovalKey(config, request, input);
   const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey) ? {
@@ -1123,6 +1129,18 @@ function writeFailure(config, request, startedAt, error) {
     ...described.tag ? { errorTag: described.tag } : {},
     ...described.code !== undefined ? { errorCode: described.code } : {},
     ...described.status !== undefined ? { errorStatus: described.status } : {}
+  });
+}
+function writeAbstained(config, request, startedAt) {
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    requestID: request.id,
+    sessionID: request.sessionID,
+    protocol: request.protocol,
+    action: request.action,
+    resourceCount: request.resources.length,
+    elapsedMs: Math.round(performance.now() - startedAt),
+    event: "abstained"
   });
 }
 function writeReceived(config, request) {

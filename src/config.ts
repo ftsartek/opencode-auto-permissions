@@ -12,6 +12,7 @@ export interface Config {
   timeoutMs: number
   userMessageCount: number
   readOnlyAgents: string[]
+  enableAutoReadOnly: boolean
   shadow: boolean
   sessionApprovals: boolean
   runtime: "auto" | "stable" | "v2"
@@ -36,6 +37,7 @@ export function parseConfig(options: Readonly<Record<string, unknown>>): Config 
       "userMessageCount",
     ),
     readOnlyAgents: parseReadOnlyAgents(options.readOnlyAgents),
+    enableAutoReadOnly: options.enableAutoReadOnly !== false,
     shadow: options.shadow === true,
     sessionApprovals: options.sessionApprovals !== false,
     runtime: parseRuntime(options.runtime),
