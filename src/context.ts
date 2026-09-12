@@ -16,7 +16,9 @@ export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
       sessionID: data.sessionID,
       action: data.action,
       resources: [...data.resources],
-      always: stringArray(data.always),
+      // Newer V2 runtimes renamed the reusable-pattern field to "save";
+      // older betas and stable events still use "always".
+      always: stringArray(data.always ?? data.save),
       ...(normalizeTool(data.source) ? { source: normalizeTool(data.source)! } : {}),
       protocol: "v2",
     }
@@ -99,15 +101,26 @@ function latestUserModel(messages: unknown[]): ReviewModel | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
     if (!isRecord(message)) continue
-    const info = isRecord(message.info) ? message.info : message
-    if (info.role !== "user" || !isRecord(info.model)) continue
-    const providerID = info.model.providerID
-    const id = info.model.modelID ?? info.model.id
-    if (typeof providerID !== "string" || typeof id !== "string") continue
-    const variant = typeof info.model.variant === "string" ? info.model.variant : undefined
-    return { providerID, id, ...(variant ? { variant } : {}) }
+    const model = messageModel(message)
+    if (model) return model
   }
   return undefined
+}
+
+function messageModel(message: Record<string, any>): ReviewModel | undefined {
+  // Newer V2 runtimes expose messages as flat records and user prompts carry no
+  // model there, so the most recent assistant turn is the closest routing
+  // signal for the reviewer.
+  const info = isRecord(message.info) ? message.info : message
+  const role = info.role ?? message.type
+  if (role !== "user" && role !== "assistant") return undefined
+  const raw = isRecord(info.model) ? info.model : undefined
+  if (!raw) return undefined
+  const providerID = raw.providerID
+  const id = raw.modelID ?? raw.id
+  if (typeof providerID !== "string" || typeof id !== "string") return undefined
+  const variant = typeof raw.variant === "string" ? raw.variant : undefined
+  return { providerID, id, ...(variant ? { variant } : {}) }
 }
 
 export async function isRequestPending(context: RuntimeContext, request: PermissionRequest): Promise<boolean> {

@@ -1,9 +1,9 @@
 import { Plugin } from "@opencode-ai/plugin/tui"
 import type { Context } from "@opencode-ai/plugin/tui/plugin"
-import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/v1/tui"
-import type { RuntimeContext } from "./types.ts"
+import { AUTO_PERMISSIONS_MESSAGE_PREFIX } from "./context.ts"
 import { installReviewer } from "./reviewer.ts"
 import { protocolForVersion } from "./stable.ts"
+import type { RuntimeContext } from "./types.ts"
 
 export const id = "opencode.auto-permissions"
 
@@ -14,7 +14,32 @@ const plugin = Plugin.define({
   },
 })
 
-export const tui: TuiPlugin = async (api, options) => {
+/**
+ * Minimal structural type for the transitional TUI plugin API used by older
+ * betas and the stable v1 TUI. The current plugin package dropped these
+ * declarations, so they are kept locally for the legacy entrypoint below.
+ */
+interface LegacyTuiState {
+  session: {
+    get(sessionID: string): { id: string; parentID?: string } | undefined
+    messages(sessionID: string): Array<{ id: string }>
+    permission(sessionID: string): unknown[]
+  }
+  part(messageID: string): unknown[]
+  path: { directory: string }
+}
+
+interface LegacyTuiApi {
+  client: unknown
+  state: LegacyTuiState
+  event: { on(type: string, handler: (event: unknown) => void): () => void }
+  ui: { toast: (input: { title?: string; message: string; variant?: string; duration?: number }) => void }
+  lifecycle: { onDispose(dispose: () => void): unknown }
+}
+
+type LegacyTuiPlugin = (api: LegacyTuiApi, options: Readonly<Record<string, unknown>> | undefined) => Promise<void>
+
+export const tui: LegacyTuiPlugin = async (api, options) => {
   if (await isStableRuntime(api.client)) return
   const dispose = installReviewer(fromLegacyApi(api, options ?? {}), { protocols: ["v2"] })
   api.lifecycle.onDispose(dispose)
@@ -26,26 +51,87 @@ function fromContext(context: Context): RuntimeContext {
   return {
     options: context.options,
     client: context.client,
-    data: context.data as RuntimeContext["data"],
+    data: context.data as unknown as RuntimeContext["data"],
     ...(context.location ? { location: context.location } : {}),
     showToast(input) {
       context.ui.toast.show(input)
     },
+    resumeAfterDenial(sessionID, reason) {
+      void resumeV2Session(context, sessionID, reason)
+    },
   }
 }
 
-async function isStableRuntime(client: Pick<TuiPluginApi, "client">["client"]): Promise<boolean> {
-  if (typeof client?.global?.health !== "function") return false
+/**
+ * Writes the denial continuation into the main session so the coding agent
+ * observes the block reason and keeps working. OpenCode V2 does not surface
+ * the permission reject message to the agent on its own, so after replying we
+ * wait for the agent loop to settle and admit a durable user prompt that
+ * resumes the session with safer guidance.
+ */
+async function resumeV2Session(context: Context, sessionID: string, reason: string): Promise<void> {
+  const client = context.client as unknown as {
+    session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> }
+  }
+  const prompt = client?.session?.prompt
+  if (typeof prompt !== "function") return
   try {
-    const result = await client.global.health()
-    const value = (result as { data?: unknown })?.data ?? result
-    return protocolForVersion((value as { version?: string })?.version) === "stable"
+    if (!(await waitForIdle(context, sessionID))) return
+    await prompt.call(client!.session, {
+      sessionID,
+      text: continuation(reason),
+      resume: true,
+    })
+  } catch {
+    // Resuming is best effort; the rejection itself already failed closed.
+  }
+}
+
+async function waitForIdle(context: Context, sessionID: string): Promise<boolean> {
+  const status = (context.data.session as { status?: (sessionID: string) => string }).status
+  if (typeof status !== "function") {
+    await delay(250)
+    return true
+  }
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (status.call(context.data.session, sessionID) !== "running") return true
+    await delay(100)
+  }
+  return false
+}
+
+function continuation(reason: string): string {
+  return `${AUTO_PERMISSIONS_MESSAGE_PREFIX} ${reason} Do not retry the exact blocked action. Continue the task using a safer alternative when possible; ask the user only if no useful safe path remains.`
+}
+
+async function isStableRuntime(client: unknown): Promise<boolean> {
+  const value = client as {
+    health?: { get?: () => Promise<unknown> }
+    global?: { health?: () => Promise<unknown> }
+  }
+  const health = typeof value?.health?.get === "function"
+    ? value.health.get
+    : typeof value?.global?.health === "function"
+      ? value.global.health
+      : undefined
+  if (!health) return false
+  try {
+    const result = unwrap(await health.call(value.health ?? value.global))
+    return protocolForVersion((result as { version?: string })?.version) === "stable"
   } catch {
     return false
   }
 }
 
-function fromLegacyApi(api: TuiPluginApi, options: Readonly<Record<string, unknown>>): RuntimeContext {
+function unwrap(result: unknown): unknown {
+  let value = result
+  for (let depth = 0; depth < 3 && typeof value === "object" && value !== null && "data" in value; depth++) {
+    value = (value as { data?: unknown }).data
+  }
+  return value
+}
+
+function fromLegacyApi(api: LegacyTuiApi, options: Readonly<Record<string, unknown>>): RuntimeContext {
   return {
     options,
     client: api.client,
@@ -86,5 +172,45 @@ function fromLegacyApi(api: TuiPluginApi, options: Readonly<Record<string, unkno
     },
     location: { directory: api.state.path.directory },
     showToast: api.ui.toast,
+    resumeAfterDenial(sessionID, reason) {
+      void resumeLegacySession(api, sessionID, reason)
+    },
   }
+}
+
+/**
+ * Best-effort denial continuation for transitional V2 betas that call the
+ * legacy TUI entrypoint. Their session prompt API takes `prompt: { text }`
+ * instead of a flat `text` field; the stable client's `session.prompt` uses a
+ * `{ path, query, body }` shape that must not be called accidentally.
+ */
+async function resumeLegacySession(api: LegacyTuiApi, sessionID: string, reason: string): Promise<void> {
+  const client = api.client as {
+    v2?: { session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> } }
+    session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> }
+    permission?: { request?: { list?: unknown } }
+  }
+  try {
+    if (typeof client?.v2?.session?.prompt === "function") {
+      await client.v2!.session!.prompt!({
+        sessionID,
+        prompt: { text: continuation(reason) },
+        delivery: "queue",
+        resume: true,
+      })
+      return
+    }
+    if (
+      typeof client?.session?.prompt === "function" &&
+      typeof client?.permission?.request?.list === "function"
+    ) {
+      await client.session!.prompt!({ sessionID, text: continuation(reason), resume: true })
+    }
+  } catch {
+    // Resuming is best effort; the rejection itself already failed closed.
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }

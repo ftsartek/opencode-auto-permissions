@@ -1,5 +1,4 @@
 import { Plugin as V2Plugin } from "@opencode-ai/plugin"
-import type { Config, Plugin, PluginModule } from "@opencode-ai/plugin/v1"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig } from "./config.ts"
 import { installReviewer } from "./reviewer.ts"
@@ -7,7 +6,6 @@ import { createStableRuntime, protocolForVersion } from "./stable.ts"
 
 const v2Plugin = V2Plugin.define({
   id: "opencode.auto-permissions.server",
-  tui: true,
   async setup(context) {
     const config = parseConfig(context.options)
     await context.agent.transform((draft) => {
@@ -24,7 +22,60 @@ const v2Plugin = V2Plugin.define({
   },
 })
 
-const legacyPlugin: Plugin = async (input, options = {}) => {
+/**
+ * Structural types for the stable v1 server plugin API. The current plugin
+ * package dropped the v1 declarations, so the shapes the stable runtime
+ * validates and calls are kept locally.
+ */
+export interface LegacyPluginInput {
+  readonly client: unknown
+  readonly directory: string
+}
+
+export interface LegacyPluginConfig {
+  agent?: Record<string, Record<string, unknown>>
+}
+
+export interface LegacyChatMessageInput {
+  sessionID: string
+  agent?: string
+  [key: string]: unknown
+}
+
+export interface LegacySystemTransformInput {
+  sessionID?: string
+  [key: string]: unknown
+}
+
+export interface LegacyEventInput {
+  event: unknown
+  [key: string]: unknown
+}
+
+export interface LegacyPluginHooks {
+  config?(value: LegacyPluginConfig, ...args: unknown[]): Promise<void> | void
+  "chat.message"?(input: LegacyChatMessageInput, ...args: unknown[]): Promise<void> | void
+  "experimental.chat.system.transform"?(
+    input: LegacySystemTransformInput,
+    output: { system: string[] },
+    ...args: unknown[]
+  ): Promise<void> | void
+  event?(input: LegacyEventInput, ...args: unknown[]): Promise<void> | void
+  dispose?(...args: unknown[]): Promise<void> | void
+}
+
+export type LegacyPlugin = (
+  input: LegacyPluginInput,
+  options?: Readonly<Record<string, unknown>>,
+) => Promise<LegacyPluginHooks>
+
+export interface PluginModule {
+  id?: string
+  setup?: unknown
+  server: LegacyPlugin
+}
+
+const legacyPlugin: LegacyPlugin = async (input, options = {}) => {
   const config = parseConfig(options)
   const reviewerSessions = new Map<string, ReturnType<typeof setTimeout>>()
   const stable = createStableRuntime(input.client, options, input.directory)
@@ -43,7 +94,7 @@ const legacyPlugin: Plugin = async (input, options = {}) => {
     return true
   }
   return {
-    async config(value: Config) {
+    async config(value: LegacyPluginConfig) {
       value.agent ??= {}
       const reviewer = {
         ...(config.model ? { model: `${config.model.providerID}/${config.model.id}` } : {}),
@@ -58,20 +109,23 @@ const legacyPlugin: Plugin = async (input, options = {}) => {
       }
       // The beta runtime accepts wildcard permission keys through its rest
       // schema, but the generated AgentConfig declaration omits that index.
-      value.agent[REVIEWER_AGENT_ID] = reviewer as unknown as NonNullable<Config["agent"]>[string]
+      value.agent[REVIEWER_AGENT_ID] = reviewer
     },
-    async "chat.message"(input) {
+    async "chat.message"(input: LegacyChatMessageInput) {
       if (input.agent !== REVIEWER_AGENT_ID) return
       clearTimeout(reviewerSessions.get(input.sessionID))
       const expiry = setTimeout(() => reviewerSessions.delete(input.sessionID), 60_000)
       expiry.unref()
       reviewerSessions.set(input.sessionID, expiry)
     },
-    async "experimental.chat.system.transform"(input, output) {
+    async "experimental.chat.system.transform"(
+      input: LegacySystemTransformInput,
+      output: { system: string[] },
+    ) {
       if (!input.sessionID || !reviewerSessions.has(input.sessionID)) return
       output.system.splice(0, output.system.length, REVIEWER_SYSTEM_PROMPT)
     },
-    async event(input) {
+    async event(input: LegacyEventInput) {
       detectedProtocol ??= protocolForVersion(eventVersion(input.event))
       if (!(await startStableReviewer())) return
       stable.emit(input.event)

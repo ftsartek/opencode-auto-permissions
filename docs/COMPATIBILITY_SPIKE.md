@@ -83,3 +83,12 @@ target sub-1.5-second P95 UX.
 - The stable SDK has no health/version endpoint. Runtime ownership is learned
   from version-bearing session events and is not cached until detection
   succeeds.
+- Current V2 builds (September 2026 and later) renamed the permission events
+  back to `permission.asked`/`permission.replied` with flat payloads and
+  renamed the reusable-pattern field from `always` to `save`. The adapter
+  accepts both field names and both event names.
+- V2 does not surface a permission reject message to the coding agent. After
+  replying `reject`, the TUI adapter waits for the session loop to settle and
+  admits a durable user prompt (`session.prompt` with `resume: true`) that
+  carries the block reason and safer-continuation guidance into the main
+  thread, mirroring the stable adapter's `promptAsync` resume.

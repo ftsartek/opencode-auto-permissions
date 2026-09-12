@@ -20,6 +20,22 @@ describe("review context isolation", () => {
     ).toMatchObject({ id: "per_stable", action: "bash", always: ["git status*"], protocol: "stable" })
   })
 
+  test("reads reusable patterns from the renamed V2 save field", () => {
+    expect(
+      normalizeAskedEvent({
+        type: "permission.asked",
+        data: { id: "per_save", sessionID: "ses_1", action: "shell", resources: ["git fetch"], save: ["git fetch*"] },
+      }),
+    ).toMatchObject({ id: "per_save", action: "shell", always: ["git fetch*"], protocol: "v2" })
+
+    expect(
+      normalizeAskedEvent({
+        type: "permission.v2.asked",
+        data: { id: "per_v2_save", sessionID: "ses_1", action: "shell", resources: ["git fetch"], save: ["git fetch*"] },
+      }),
+    ).toMatchObject({ id: "per_v2_save", always: ["git fetch*"], protocol: "v2" })
+  })
+
   test("includes only real human text and excludes ambient or agent content", async () => {
     const context: RuntimeContext = {
       options: {},

@@ -1,8 +1,12 @@
-import type {
-  ModelRef,
-} from "@opencode-ai/sdk/v2"
+// Structural equivalent of the OpenCode ModelRef used by both the stable and
+// V2 clients. Declared locally because the stable and beta SDK packages type
+// the same field set under different module paths.
+export interface ReviewModel {
+  providerID: string
+  id: string
+  variant?: string
+}
 
-export type ReviewModel = ModelRef
 export type PermissionProtocol = "stable" | "v2"
 
 export interface PermissionRequest {

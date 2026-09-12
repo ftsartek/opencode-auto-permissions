@@ -165,7 +165,7 @@ The compatibility baseline was acceptance-tested in the real TUI with:
 - OpenCode stable `1.18.12`
 - OpenCode V2 `0.0.0-beta-202608110357`
 
-The runtime protocol is detected automatically; stable permission events are handled by the server adapter and V2 events by the TUI adapter. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
+Newer V2 builds (September 2026 and later) renamed the permission event payloads (`permission.v2.asked` back to `permission.asked`, and the reusable-pattern field from `always` to `save`); the plugin accepts both shapes. The runtime protocol is detected automatically; stable permission events are handled by the server adapter and V2 events by the TUI adapter. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
 
 ## Development
 
