@@ -262,7 +262,7 @@ function isPluginContinuation(text) {
 }
 
 // src/diagnostics.ts
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { mkdir, open, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 var MAX_RECORDS = 100;
@@ -341,17 +341,29 @@ function bounded(value) {
 }
 async function appendBounded(path, record) {
   await mkdir(dirname(path), { recursive: true });
+  const line = JSON.stringify(record) + `
+`;
   const existing = await readFile(path, "utf8").catch((error) => {
     if (error.code === "ENOENT")
       return "";
     throw error;
   });
-  const records = existing.split(`
+  if (existing.split(`
+`).filter(Boolean).length >= MAX_RECORDS * 2) {
+    const records = existing.split(`
 `).filter(Boolean);
-  records.push(JSON.stringify(record));
-  await writeFile(path, records.slice(-MAX_RECORDS).join(`
+    records.push(JSON.stringify(record));
+    await writeFile(path, records.slice(-MAX_RECORDS).join(`
 `) + `
 `, { mode: 384 });
+    return;
+  }
+  const handle = await open(path, "a");
+  try {
+    await handle.appendFile(line, "utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 // src/config.ts
@@ -1351,6 +1363,9 @@ function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// src/version.ts
+var PLUGIN_VERSION = "0.2.13";
+
 // src/tui.ts
 var id = "opencode.auto-permissions";
 var plugin = define({
@@ -1367,6 +1382,7 @@ var tui = async (api, options) => {
 };
 var tui_default = { ...plugin, tui };
 function fromContext(context) {
+  recordEnvironment(context.options, context.client, context.data.session);
   return {
     options: context.options,
     client: context.client,
@@ -1380,24 +1396,84 @@ function fromContext(context) {
     }
   };
 }
+function recordEnvironment(options, client, sessionData) {
+  const config = parseConfig(options);
+  if (!config.diagnosticsPath)
+    return;
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    event: "plugin_environment",
+    version: PLUGIN_VERSION,
+    clientCapabilities: clientCapabilities(client, sessionData)
+  });
+}
+function clientCapabilities(client, sessionData) {
+  const value = client;
+  const state = sessionData;
+  const capabilities = [];
+  if (typeof value?.session?.prompt === "function")
+    capabilities.push("session.prompt");
+  if (typeof value?.v2?.session?.prompt === "function")
+    capabilities.push("v2.session.prompt");
+  if (typeof value?.session?.permission?.reply === "function")
+    capabilities.push("session.permission.reply");
+  if (typeof value?.permission?.reply === "function")
+    capabilities.push("permission.reply");
+  if (typeof value?.permission?.request?.list === "function")
+    capabilities.push("permission.request.list");
+  if (typeof value?.health?.get === "function")
+    capabilities.push("health.get");
+  if (typeof value?.global?.health === "function")
+    capabilities.push("global.health");
+  if (typeof state?.status === "function")
+    capabilities.push("session.status");
+  return capabilities;
+}
 async function resumeV2Session(context, sessionID, reason) {
   const config = parseConfig(context.options);
   const client = context.client;
-  const prompt = client?.session?.prompt;
-  if (typeof prompt !== "function")
-    return;
   const text = continuation(reason);
   const running = isRunning(context, sessionID);
-  try {
-    await prompt.call(client.session, {
+  const flatPrompt = client?.session?.prompt;
+  const legacyPrompt = client?.v2?.session?.prompt;
+  if (typeof flatPrompt !== "function" && typeof legacyPrompt !== "function") {
+    writeDiagnostic(config.diagnosticsPath, {
+      timestamp: new Date().toISOString(),
       sessionID,
-      text,
-      ...running ? { delivery: "steer" } : { resume: true }
+      event: "resume_failed",
+      errorMessage: "session prompt API unavailable in this runtime"
     });
-    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume");
+    return;
+  }
+  try {
+    if (typeof flatPrompt === "function") {
+      await flatPrompt.call(client.session, {
+        sessionID,
+        text,
+        ...running ? { delivery: "steer" } : { resume: true }
+      });
+      writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume");
+      return;
+    }
+    await legacyPrompt.call(client.v2.session, {
+      sessionID,
+      prompt: { text },
+      delivery: running ? "steer" : "queue",
+      resume: true
+    });
+    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "queue");
   } catch (error) {
     try {
-      await prompt.call(client.session, { sessionID, text, resume: true });
+      if (typeof flatPrompt === "function") {
+        await flatPrompt.call(client.session, { sessionID, text, resume: true });
+      } else {
+        await legacyPrompt.call(client.v2.session, {
+          sessionID,
+          prompt: { text },
+          delivery: "queue",
+          resume: true
+        });
+      }
       writeResume(config.diagnosticsPath, sessionID, "resumed", "resume_fallback");
     } catch (fallbackError) {
       writeDiagnostic(config.diagnosticsPath, {
@@ -1439,6 +1515,7 @@ function unwrap2(result) {
   return value;
 }
 function fromLegacyApi(api, options) {
+  recordEnvironment(options, api.client, api.state.session);
   return {
     options,
     client: api.client,

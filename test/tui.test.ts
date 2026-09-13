@@ -157,6 +157,31 @@ describe("TUI plugin denial continuation", () => {
     expect(app.prompts[1]).toMatchObject({ sessionID: "ses_root", resume: true })
   })
 
+  test("steers through the legacy V2 client shape when the flat prompt is unavailable", async () => {
+    const app = continuationHarness(() => "running")
+    const client = app.app.client as {
+      permission?: { reply?: unknown }
+      session?: { prompt?: unknown }
+      v2?: { session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> } }
+    }
+    client.session = { prompt: undefined }
+    client.v2 = {
+      session: {
+        prompt: async (input: Record<string, unknown>) => {
+          app.prompts.push(input)
+        },
+      },
+    }
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.prompts).toHaveLength(1)
+    expect(app.prompts[0]).toMatchObject({ sessionID: "ses_root", delivery: "steer", resume: true })
+    expect(String((app.prompts[0]?.prompt as { text?: string }).text)).toContain(
+      "[Auto Permissions] The requested action was blocked:",
+    )
+  })
+
   test("resumes through the legacy V2 client after a rejection", async () => {
     const handlers = new Map<string, Set<(event: unknown) => void>>()
     const replies: Array<Record<string, unknown>> = []

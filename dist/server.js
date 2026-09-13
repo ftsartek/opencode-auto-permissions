@@ -8308,7 +8308,7 @@ Decision rules:
 Submit the final decision through the requested output format. When structured output is unavailable, return only the equivalent JSON object without Markdown fences.`;
 
 // src/diagnostics.ts
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { mkdir, open, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 var MAX_RECORDS = 100;
@@ -8387,17 +8387,29 @@ function bounded(value) {
 }
 async function appendBounded(path, record) {
   await mkdir(dirname(path), { recursive: true });
+  const line = JSON.stringify(record) + `
+`;
   const existing = await readFile(path, "utf8").catch((error) => {
     if (error.code === "ENOENT")
       return "";
     throw error;
   });
-  const records = existing.split(`
+  if (existing.split(`
+`).filter(Boolean).length >= MAX_RECORDS * 2) {
+    const records = existing.split(`
 `).filter(Boolean);
-  records.push(JSON.stringify(record));
-  await writeFile(path, records.slice(-MAX_RECORDS).join(`
+    records.push(JSON.stringify(record));
+    await writeFile(path, records.slice(-MAX_RECORDS).join(`
 `) + `
 `, { mode: 384 });
+    return;
+  }
+  const handle = await open(path, "a");
+  try {
+    await handle.appendFile(line, "utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 // src/config.ts

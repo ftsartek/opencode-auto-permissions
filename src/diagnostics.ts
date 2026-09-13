@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { Decision, PermissionRequest } from "./types.ts"
@@ -8,7 +8,15 @@ const queues = new Map<string, Promise<void>>()
 
 export interface DiagnosticRecord {
   timestamp: string
-  event: "plugin_started" | "request_received" | "request_cancelled" | "decision" | "failure" | "resumed" | "resume_failed"
+  event:
+    | "plugin_started"
+    | "plugin_environment"
+    | "request_received"
+    | "request_cancelled"
+    | "decision"
+    | "failure"
+    | "resumed"
+    | "resume_failed"
   requestID?: string
   sessionID?: string
   protocol?: PermissionRequest["protocol"]
@@ -22,13 +30,15 @@ export interface DiagnosticRecord {
   reason?: string
   shadow?: boolean
   replyResult?: "replied" | "not_found" | "manual"
-  delivery?: "steer" | "resume" | "resume_fallback"
+  delivery?: "steer" | "resume" | "resume_fallback" | "queue"
   failureCategory?: "timeout" | "cancelled" | "invalid_response" | "error"
   errorName?: string
   errorMessage?: string
   errorTag?: string
   errorCode?: string | number
   errorStatus?: string | number
+  version?: string
+  clientCapabilities?: string[]
 }
 
 export function defaultDiagnosticsPath(): string {
@@ -111,11 +121,24 @@ function bounded(value: string): string {
 
 async function appendBounded(path: string, record: DiagnosticRecord): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
+  // Multiple plugin processes share one diagnostics file. Atomic appends keep
+  // concurrent writers from clobbering each other; the bounded rewrite runs
+  // only occasionally when the file grows well past its cap.
+  const line = JSON.stringify(record) + "\n"
   const existing = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return ""
     throw error
   })
-  const records = existing.split("\n").filter(Boolean)
-  records.push(JSON.stringify(record))
-  await writeFile(path, records.slice(-MAX_RECORDS).join("\n") + "\n", { mode: 0o600 })
+  if (existing.split("\n").filter(Boolean).length >= MAX_RECORDS * 2) {
+    const records = existing.split("\n").filter(Boolean)
+    records.push(JSON.stringify(record))
+    await writeFile(path, records.slice(-MAX_RECORDS).join("\n") + "\n", { mode: 0o600 })
+    return
+  }
+  const handle = await open(path, "a")
+  try {
+    await handle.appendFile(line, "utf8")
+  } finally {
+    await handle.close()
+  }
 }

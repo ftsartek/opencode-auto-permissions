@@ -6,6 +6,7 @@ import { describeError, writeDiagnostic } from "./diagnostics.ts"
 import { installReviewer } from "./reviewer.ts"
 import { protocolForVersion } from "./stable.ts"
 import type { RuntimeContext } from "./types.ts"
+import { PLUGIN_VERSION } from "./version.ts"
 
 export const id = "opencode.auto-permissions"
 
@@ -50,6 +51,7 @@ export const tui: LegacyTuiPlugin = async (api, options) => {
 export default { ...plugin, tui }
 
 function fromContext(context: Context): RuntimeContext {
+  recordEnvironment(context.options, context.client, context.data.session)
   return {
     options: context.options,
     client: context.client,
@@ -65,33 +67,99 @@ function fromContext(context: Context): RuntimeContext {
 }
 
 /**
+ * Records the plugin version and the client capabilities this TUI process can
+ * see. Multiple OpenCode generations expose different client shapes, so the
+ * resume path probes rather than assumes, and the diagnostics make the probe
+ * result observable.
+ */
+function recordEnvironment(
+  options: Readonly<Record<string, unknown>>,
+  client: unknown,
+  sessionData: unknown,
+): void {
+  const config = parseConfig(options)
+  if (!config.diagnosticsPath) return
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    event: "plugin_environment",
+    version: PLUGIN_VERSION,
+    clientCapabilities: clientCapabilities(client, sessionData),
+  })
+}
+
+function clientCapabilities(client: unknown, sessionData: unknown): string[] {
+  const value = client as Record<string, any>
+  const state = sessionData as { status?: unknown }
+  const capabilities: string[] = []
+  if (typeof value?.session?.prompt === "function") capabilities.push("session.prompt")
+  if (typeof value?.v2?.session?.prompt === "function") capabilities.push("v2.session.prompt")
+  if (typeof value?.session?.permission?.reply === "function") capabilities.push("session.permission.reply")
+  if (typeof value?.permission?.reply === "function") capabilities.push("permission.reply")
+  if (typeof value?.permission?.request?.list === "function") capabilities.push("permission.request.list")
+  if (typeof value?.health?.get === "function") capabilities.push("health.get")
+  if (typeof value?.global?.health === "function") capabilities.push("global.health")
+  if (typeof state?.status === "function") capabilities.push("session.status")
+  return capabilities
+}
+
+/**
  * Writes the denial continuation into the main session so the coding agent
  * observes the block reason and keeps working. OpenCode V2 does not surface
  * the permission reject message to the agent on its own, so after replying we
  * admit a durable user prompt carrying the reason and safer-continuation
  * guidance. While the agent loop is still running the prompt is steered into
  * the active run so the feedback lands mid-turn; when the session has gone
- * idle it is admitted with resume so a fresh loop starts.
+ * idle it is admitted with resume so a fresh loop starts. Both the current
+ * flat client and the older `v2` client shapes are supported.
  */
 async function resumeV2Session(context: Context, sessionID: string, reason: string): Promise<void> {
   const config = parseConfig(context.options)
   const client = context.client as unknown as {
     session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> }
+    v2?: { session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> } }
   }
-  const prompt = client?.session?.prompt
-  if (typeof prompt !== "function") return
   const text = continuation(reason)
   const running = isRunning(context, sessionID)
-  try {
-    await prompt.call(client!.session, {
+  const flatPrompt = client?.session?.prompt
+  const legacyPrompt = client?.v2?.session?.prompt
+  if (typeof flatPrompt !== "function" && typeof legacyPrompt !== "function") {
+    writeDiagnostic(config.diagnosticsPath, {
+      timestamp: new Date().toISOString(),
       sessionID,
-      text,
-      ...(running ? { delivery: "steer" } : { resume: true }),
+      event: "resume_failed",
+      errorMessage: "session prompt API unavailable in this runtime",
     })
-    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume")
+    return
+  }
+  try {
+    if (typeof flatPrompt === "function") {
+      await flatPrompt.call(client!.session, {
+        sessionID,
+        text,
+        ...(running ? { delivery: "steer" } : { resume: true }),
+      })
+      writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume")
+      return
+    }
+    await legacyPrompt!.call(client!.v2!.session, {
+      sessionID,
+      prompt: { text },
+      delivery: running ? "steer" : "queue",
+      resume: true,
+    })
+    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "queue")
   } catch (error) {
     try {
-      await prompt.call(client!.session, { sessionID, text, resume: true })
+      if (typeof flatPrompt === "function") {
+        await flatPrompt.call(client!.session, { sessionID, text, resume: true })
+      } else {
+        await legacyPrompt!.call(client!.v2!.session, {
+          sessionID,
+          prompt: { text },
+          delivery: "queue",
+          resume: true,
+        })
+      }
       writeResume(config.diagnosticsPath, sessionID, "resumed", "resume_fallback")
     } catch (fallbackError) {
       writeDiagnostic(config.diagnosticsPath, {
@@ -108,7 +176,7 @@ function writeResume(
   path: string | undefined,
   sessionID: string,
   event: "resumed",
-  delivery: "steer" | "resume" | "resume_fallback",
+  delivery: "steer" | "resume" | "resume_fallback" | "queue",
 ): void {
   writeDiagnostic(path, { timestamp: new Date().toISOString(), sessionID, event, delivery })
 }
@@ -150,6 +218,7 @@ function unwrap(result: unknown): unknown {
 }
 
 function fromLegacyApi(api: LegacyTuiApi, options: Readonly<Record<string, unknown>>): RuntimeContext {
+  recordEnvironment(options, api.client, api.state.session)
   return {
     options,
     client: api.client,
