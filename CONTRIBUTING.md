@@ -108,4 +108,20 @@ docs/                    # Build plan, compatibility notes, testing guide
 ## Releases
 
 Releases are cut from `main` by maintainers. Version tags follow `vX.Y.Z` and
-the npm package is published from the tagged commit.
+the npm package is published from the tagged commit. Every release must land
+in **all three places, consistently**:
+
+1. **Tag** — commit on `main`, tag `vX.Y.Z`, push the branch and the tag.
+2. **npm** — `bun publish --access public` from the tagged commit (requires
+   the npm web-auth 2FA flow; the browser link appears in the command
+   output).
+3. **GitHub release** — `gh release create vX.Y.Z --title vX.Y.Z --notes ...`
+   with notes describing the user-facing changes. The GitHub release, the
+   tag, and the npm version must all match; do not publish one without the
+   others.
+
+Before tagging, confirm `bun run verify` passes and that the README, badges,
+and compatibility notes reflect the release (plugin CLI commands, tested
+baselines, test counts). Bump the `version` field in `package.json` and keep
+`PLUGIN_VERSION` in `src/version.ts` in sync — it is what the runtime
+diagnostics report.
