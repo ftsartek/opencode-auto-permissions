@@ -88,7 +88,9 @@ target sub-1.5-second P95 UX.
   renamed the reusable-pattern field from `always` to `save`. The adapter
   accepts both field names and both event names.
 - V2 does not surface a permission reject message to the coding agent. After
-  replying `reject`, the TUI adapter waits for the session loop to settle and
-  admits a durable user prompt (`session.prompt` with `resume: true`) that
-  carries the block reason and safer-continuation guidance into the main
-  thread, mirroring the stable adapter's `promptAsync` resume.
+  replying `reject`, the TUI adapter admits a durable user prompt carrying
+  the block reason and safer-continuation guidance into the main thread,
+  mirroring the stable adapter's `promptAsync` resume. While the agent loop is
+  still running the prompt is delivered with `delivery: "steer"` so the
+  feedback lands mid-turn; once idle it is admitted with `resume: true`.
+  Resume outcomes are recorded as `resumed`/`resume_failed` diagnostics.

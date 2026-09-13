@@ -50,15 +50,13 @@ describe("TUI plugin runtime ownership", () => {
 })
 
 describe("TUI plugin denial continuation", () => {
-  test("writes the denial reason into the main session after a rejection", async () => {
+  function continuationHarness(status: () => string) {
     const handlers = new Map<string, Set<(event: unknown) => void>>()
     const replies: Array<Record<string, unknown>> = []
     const prompts: Array<Record<string, unknown>> = []
-    const statuses: string[] = ["running", "running", "idle"]
     const pending = [
       { id: "per_1", sessionID: "ses_root", action: "shell", resources: ["sudo rm -rf /"], save: [] },
     ]
-
     const app: Context = {
       options: { model: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731" },
       client: {
@@ -84,14 +82,17 @@ describe("TUI plugin denial continuation", () => {
         session: {
           root: (id: string) => id,
           get: (id: string) => ({ id }),
-          status: () => statuses.shift() ?? "idle",
+          status,
           message: { list: () => [], get: () => undefined, sync: async () => {} },
           permission: { list: () => pending, sync: async () => {} },
         },
       },
       ui: { toast: { show() {} } },
     } as unknown as Context
+    return { app, handlers, replies, prompts, pending }
+  }
 
+  async function emitDenial(app: Context, handlers: Map<string, Set<(event: unknown) => void>>, pending: unknown[]) {
     const dispose = await plugin.setup(app)
     try {
       const emit = (type: string, data: unknown) => {
@@ -99,23 +100,61 @@ describe("TUI plugin denial continuation", () => {
       }
       emit("permission.asked", pending[0])
       await settle()
-
-      expect(replies).toHaveLength(1)
-      expect(replies[0]).toMatchObject({
-        sessionID: "ses_root",
-        requestID: "per_1",
-        reply: "reject",
-        message: expect.stringContaining("blocked"),
-      })
-      expect(prompts).toHaveLength(1)
-      const continuation = String(prompts[0]?.text)
-      expect(prompts[0]).toMatchObject({ sessionID: "ses_root", resume: true })
-      expect(continuation).toContain("[Auto Permissions] The requested action was blocked:")
-      expect(continuation).toContain("Do not retry the exact blocked action")
-      expect(statuses).toEqual([])
     } finally {
       dispose?.()
     }
+  }
+
+  test("steers the denial reason into a running session", async () => {
+    const app = continuationHarness(() => "running")
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.replies).toHaveLength(1)
+    expect(app.replies[0]).toMatchObject({
+      sessionID: "ses_root",
+      requestID: "per_1",
+      reply: "reject",
+      message: expect.stringContaining("blocked"),
+    })
+    expect(app.prompts).toHaveLength(1)
+    const continuation = String(app.prompts[0]?.text)
+    expect(app.prompts[0]).toMatchObject({ sessionID: "ses_root", delivery: "steer" })
+    expect(app.prompts[0]).not.toHaveProperty("resume")
+    expect(continuation).toContain("[Auto Permissions] The requested action was blocked:")
+    expect(continuation).toContain("Do not retry the exact blocked action")
+  })
+
+  test("resumes an idle session with the denial reason", async () => {
+    const app = continuationHarness(() => "idle")
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(app.prompts).toHaveLength(1)
+    const continuation = String(app.prompts[0]?.text)
+    expect(app.prompts[0]).toMatchObject({ sessionID: "ses_root", resume: true })
+    expect(app.prompts[0]).not.toHaveProperty("delivery")
+    expect(continuation).toContain("[Auto Permissions] The requested action was blocked:")
+  })
+
+  test("falls back to a resume prompt when steering fails", async () => {
+    const app = continuationHarness(() => "running")
+    let calls = 0
+    const realPrompt = app.app.client.session.prompt as (input: Record<string, unknown>) => Promise<unknown>
+    ;(app.app.client as { session: { prompt: unknown } }).session.prompt = async (input: Record<string, unknown>) => {
+      calls++
+      if (calls === 1) {
+        app.prompts.push(input)
+        throw new Error("no active run")
+      }
+      return realPrompt(input)
+    }
+
+    await emitDenial(app.app, app.handlers, app.pending)
+
+    expect(calls).toBe(2)
+    expect(app.prompts[0]).toMatchObject({ sessionID: "ses_root", delivery: "steer" })
+    expect(app.prompts[1]).toMatchObject({ sessionID: "ses_root", resume: true })
   })
 
   test("resumes through the legacy V2 client after a rejection", async () => {

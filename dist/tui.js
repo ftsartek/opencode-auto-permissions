@@ -261,6 +261,166 @@ function isPluginContinuation(text) {
   return text.trimStart().startsWith(AUTO_PERMISSIONS_MESSAGE_PREFIX);
 }
 
+// src/diagnostics.ts
+import { mkdir, readFile, writeFile } from "fs/promises";
+import { homedir } from "os";
+import { dirname, join } from "path";
+var MAX_RECORDS = 100;
+var queues = new Map;
+function defaultDiagnosticsPath() {
+  const stateRoot = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+  return join(stateRoot, "opencode", "auto-permissions", "decisions.jsonl");
+}
+function writeDiagnostic(path, record) {
+  if (!path)
+    return;
+  const previous = queues.get(path) ?? Promise.resolve();
+  const next = previous.then(() => appendBounded(path, record)).catch(() => {
+    return;
+  });
+  queues.set(path, next);
+  next.finally(() => {
+    if (queues.get(path) === next)
+      queues.delete(path);
+  });
+}
+function failureCategory(error) {
+  const message = describeError(error).message;
+  if (/timed out/i.test(message))
+    return "timeout";
+  if (error instanceof DOMException && error.name === "AbortError")
+    return "cancelled";
+  if (/invalid decision|no structured output|invalid response/i.test(message))
+    return "invalid_response";
+  return "error";
+}
+function describeError(error) {
+  const records = nestedRecords(error);
+  const name = firstString(records, ["name"]) ?? (error instanceof Error ? error.name : "Error");
+  const message = firstString(records, ["message", "detail", "reason", "error_description"]) ?? (typeof error === "string" ? error : "Unknown non-Error failure");
+  const tag = firstString(records, ["_tag", "type"]);
+  const code = firstScalar(records, ["code"]);
+  const status = firstScalar(records, ["status", "statusCode"]);
+  return {
+    name: bounded(name),
+    message: bounded(message),
+    ...tag ? { tag: bounded(tag) } : {},
+    ...code !== undefined ? { code } : {},
+    ...status !== undefined ? { status } : {}
+  };
+}
+function nestedRecords(value) {
+  const records = [];
+  let current = value;
+  for (let depth = 0;depth < 4 && typeof current === "object" && current !== null; depth++) {
+    const record = current;
+    records.push(record);
+    current = record.error ?? record.data ?? record.cause;
+  }
+  return records;
+}
+function firstString(records, keys) {
+  for (const record of records) {
+    for (const key of keys) {
+      if (typeof record[key] === "string" && record[key])
+        return record[key];
+    }
+  }
+}
+function firstScalar(records, keys) {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === "string" || typeof value === "number")
+        return value;
+    }
+  }
+}
+function bounded(value) {
+  return value.slice(0, 500);
+}
+async function appendBounded(path, record) {
+  await mkdir(dirname(path), { recursive: true });
+  const existing = await readFile(path, "utf8").catch((error) => {
+    if (error.code === "ENOENT")
+      return "";
+    throw error;
+  });
+  const records = existing.split(`
+`).filter(Boolean);
+  records.push(JSON.stringify(record));
+  await writeFile(path, records.slice(-MAX_RECORDS).join(`
+`) + `
+`, { mode: 384 });
+}
+
+// src/config.ts
+var DEFAULT_TIMEOUT_MS = 30000;
+var DEFAULT_USER_MESSAGE_COUNT = 8;
+function parseConfig(options) {
+  const modelValue = options.model;
+  const variant = parseVariant(options.variant);
+  const model = parseModel(modelValue, variant);
+  return {
+    model,
+    modelLabel: typeof modelValue === "string" ? modelValue : undefined,
+    variant,
+    timeoutMs: boundedInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS, 100, 30000, "timeoutMs"),
+    userMessageCount: boundedInteger(options.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
+    shadow: options.shadow === true,
+    sessionApprovals: options.sessionApprovals !== false,
+    runtime: parseRuntime(options.runtime),
+    diagnosticsPath: parseDiagnosticsPath(options.debug)
+  };
+}
+function parseModel(value, variant) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error('Auto Permissions model must use "provider/model" form');
+  }
+  const slash = value.indexOf("/");
+  if (slash < 1 || slash === value.length - 1) {
+    throw new Error('Auto Permissions model must use "provider/model" form');
+  }
+  const providerID = value.slice(0, slash).trim();
+  const id = value.slice(slash + 1).trim();
+  if (!providerID || !id)
+    throw new Error('Auto Permissions model must use "provider/model" form');
+  return { providerID, id, ...variant ? { variant } : {} };
+}
+function parseVariant(value) {
+  if (value === undefined)
+    return;
+  if (typeof value === "string" && value.trim())
+    return value.trim();
+  throw new Error("Auto Permissions variant must be a non-empty string");
+}
+function parseDiagnosticsPath(value) {
+  if (value === undefined || value === false)
+    return;
+  if (value === true)
+    return defaultDiagnosticsPath();
+  if (typeof value === "string" && value.trim())
+    return value.trim();
+  throw new Error("Auto Permissions debug must be true, false, or a file path");
+}
+function parseRuntime(value) {
+  if (value === undefined)
+    return "auto";
+  if (value === "auto" || value === "stable" || value === "v2")
+    return value;
+  throw new Error('Auto Permissions runtime must be "auto", "stable", or "v2"');
+}
+function boundedInteger(value, fallback, minimum, maximum, name) {
+  if (value === undefined)
+    return fallback;
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`Auto Permissions ${name} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return value;
+}
+
 // src/agent.ts
 var REVIEWER_AGENT_ID = "auto-permissions-reviewer";
 var DECISION_SCHEMA = {
@@ -308,14 +468,14 @@ Decision rules:
 Submit the final decision through the requested output format. When structured output is unavailable, return only the equivalent JSON object without Markdown fences.`;
 
 // src/opencode-client.ts
-import { mkdir } from "fs/promises";
+import { mkdir as mkdir2 } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join as join2 } from "path";
 var REVIEWER_PERMISSIONS = [
   { permission: "*", pattern: "*", action: "deny" },
   { permission: "StructuredOutput", pattern: "*", action: "allow" }
 ];
-var REVIEWER_DIRECTORY = join(tmpdir(), "opencode-auto-permissions", "reviewer");
+var REVIEWER_DIRECTORY = join2(tmpdir(), "opencode-auto-permissions", "reviewer");
 var REVIEWER_SESSION_TITLE = "Auto Permissions review";
 
 class OpenCodeClientAdapter {
@@ -324,7 +484,7 @@ class OpenCodeClientAdapter {
     this.client = client;
   }
   async prewarm() {
-    await mkdir(REVIEWER_DIRECTORY, { recursive: true });
+    await mkdir2(REVIEWER_DIRECTORY, { recursive: true });
     const location = { directory: REVIEWER_DIRECTORY };
     const requests = [];
     if (typeof this.client.app?.agents === "function")
@@ -353,7 +513,7 @@ class OpenCodeClientAdapter {
     if (!session || typeof session.create !== "function" || typeof session.prompt !== "function") {
       throw new Error("OpenCode reviewer session API is unavailable");
     }
-    await mkdir(REVIEWER_DIRECTORY, { recursive: true });
+    await mkdir2(REVIEWER_DIRECTORY, { recursive: true });
     const location = { directory: REVIEWER_DIRECTORY };
     let sessionID;
     const abortRemote = () => {
@@ -476,7 +636,7 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
     }
   }
   async generateCurrent(input) {
-    await mkdir(REVIEWER_DIRECTORY, { recursive: true });
+    await mkdir2(REVIEWER_DIRECTORY, { recursive: true });
     let sessionID;
     const abortRemote = () => {
       if (sessionID)
@@ -571,166 +731,6 @@ function abortError(reason) {
 }
 function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// src/diagnostics.ts
-import { mkdir as mkdir2, readFile, writeFile } from "fs/promises";
-import { homedir } from "os";
-import { dirname, join as join2 } from "path";
-var MAX_RECORDS = 100;
-var queues = new Map;
-function defaultDiagnosticsPath() {
-  const stateRoot = process.env.XDG_STATE_HOME ?? join2(homedir(), ".local", "state");
-  return join2(stateRoot, "opencode", "auto-permissions", "decisions.jsonl");
-}
-function writeDiagnostic(path, record) {
-  if (!path)
-    return;
-  const previous = queues.get(path) ?? Promise.resolve();
-  const next = previous.then(() => appendBounded(path, record)).catch(() => {
-    return;
-  });
-  queues.set(path, next);
-  next.finally(() => {
-    if (queues.get(path) === next)
-      queues.delete(path);
-  });
-}
-function failureCategory(error) {
-  const message = describeError(error).message;
-  if (/timed out/i.test(message))
-    return "timeout";
-  if (error instanceof DOMException && error.name === "AbortError")
-    return "cancelled";
-  if (/invalid decision|no structured output|invalid response/i.test(message))
-    return "invalid_response";
-  return "error";
-}
-function describeError(error) {
-  const records = nestedRecords(error);
-  const name = firstString(records, ["name"]) ?? (error instanceof Error ? error.name : "Error");
-  const message = firstString(records, ["message", "detail", "reason", "error_description"]) ?? (typeof error === "string" ? error : "Unknown non-Error failure");
-  const tag = firstString(records, ["_tag", "type"]);
-  const code = firstScalar(records, ["code"]);
-  const status = firstScalar(records, ["status", "statusCode"]);
-  return {
-    name: bounded(name),
-    message: bounded(message),
-    ...tag ? { tag: bounded(tag) } : {},
-    ...code !== undefined ? { code } : {},
-    ...status !== undefined ? { status } : {}
-  };
-}
-function nestedRecords(value) {
-  const records = [];
-  let current = value;
-  for (let depth = 0;depth < 4 && typeof current === "object" && current !== null; depth++) {
-    const record = current;
-    records.push(record);
-    current = record.error ?? record.data ?? record.cause;
-  }
-  return records;
-}
-function firstString(records, keys) {
-  for (const record of records) {
-    for (const key of keys) {
-      if (typeof record[key] === "string" && record[key])
-        return record[key];
-    }
-  }
-}
-function firstScalar(records, keys) {
-  for (const record of records) {
-    for (const key of keys) {
-      const value = record[key];
-      if (typeof value === "string" || typeof value === "number")
-        return value;
-    }
-  }
-}
-function bounded(value) {
-  return value.slice(0, 500);
-}
-async function appendBounded(path, record) {
-  await mkdir2(dirname(path), { recursive: true });
-  const existing = await readFile(path, "utf8").catch((error) => {
-    if (error.code === "ENOENT")
-      return "";
-    throw error;
-  });
-  const records = existing.split(`
-`).filter(Boolean);
-  records.push(JSON.stringify(record));
-  await writeFile(path, records.slice(-MAX_RECORDS).join(`
-`) + `
-`, { mode: 384 });
-}
-
-// src/config.ts
-var DEFAULT_TIMEOUT_MS = 30000;
-var DEFAULT_USER_MESSAGE_COUNT = 8;
-function parseConfig(options) {
-  const modelValue = options.model;
-  const variant = parseVariant(options.variant);
-  const model = parseModel(modelValue, variant);
-  return {
-    model,
-    modelLabel: typeof modelValue === "string" ? modelValue : undefined,
-    variant,
-    timeoutMs: boundedInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS, 100, 30000, "timeoutMs"),
-    userMessageCount: boundedInteger(options.userMessageCount, DEFAULT_USER_MESSAGE_COUNT, 1, 20, "userMessageCount"),
-    shadow: options.shadow === true,
-    sessionApprovals: options.sessionApprovals !== false,
-    runtime: parseRuntime(options.runtime),
-    diagnosticsPath: parseDiagnosticsPath(options.debug)
-  };
-}
-function parseModel(value, variant) {
-  if (value === undefined)
-    return;
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error('Auto Permissions model must use "provider/model" form');
-  }
-  const slash = value.indexOf("/");
-  if (slash < 1 || slash === value.length - 1) {
-    throw new Error('Auto Permissions model must use "provider/model" form');
-  }
-  const providerID = value.slice(0, slash).trim();
-  const id = value.slice(slash + 1).trim();
-  if (!providerID || !id)
-    throw new Error('Auto Permissions model must use "provider/model" form');
-  return { providerID, id, ...variant ? { variant } : {} };
-}
-function parseVariant(value) {
-  if (value === undefined)
-    return;
-  if (typeof value === "string" && value.trim())
-    return value.trim();
-  throw new Error("Auto Permissions variant must be a non-empty string");
-}
-function parseDiagnosticsPath(value) {
-  if (value === undefined || value === false)
-    return;
-  if (value === true)
-    return defaultDiagnosticsPath();
-  if (typeof value === "string" && value.trim())
-    return value.trim();
-  throw new Error("Auto Permissions debug must be true, false, or a file path");
-}
-function parseRuntime(value) {
-  if (value === undefined)
-    return "auto";
-  if (value === "auto" || value === "stable" || value === "v2")
-    return value;
-  throw new Error('Auto Permissions runtime must be "auto", "stable", or "v2"');
-}
-function boundedInteger(value, fallback, minimum, maximum, name) {
-  if (value === undefined)
-    return fallback;
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`Auto Permissions ${name} must be an integer from ${minimum} to ${maximum}`);
-  }
-  return value;
 }
 
 // src/policy.ts
@@ -1381,32 +1381,40 @@ function fromContext(context) {
   };
 }
 async function resumeV2Session(context, sessionID, reason) {
+  const config = parseConfig(context.options);
   const client = context.client;
   const prompt = client?.session?.prompt;
   if (typeof prompt !== "function")
     return;
+  const text = continuation(reason);
+  const running = isRunning(context, sessionID);
   try {
-    if (!await waitForIdle2(context, sessionID))
-      return;
     await prompt.call(client.session, {
       sessionID,
-      text: continuation(reason),
-      resume: true
+      text,
+      ...running ? { delivery: "steer" } : { resume: true }
     });
-  } catch {}
+    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume");
+  } catch (error) {
+    try {
+      await prompt.call(client.session, { sessionID, text, resume: true });
+      writeResume(config.diagnosticsPath, sessionID, "resumed", "resume_fallback");
+    } catch (fallbackError) {
+      writeDiagnostic(config.diagnosticsPath, {
+        timestamp: new Date().toISOString(),
+        sessionID,
+        event: "resume_failed",
+        errorMessage: describeError(fallbackError).message
+      });
+    }
+  }
 }
-async function waitForIdle2(context, sessionID) {
+function writeResume(path, sessionID, event, delivery) {
+  writeDiagnostic(path, { timestamp: new Date().toISOString(), sessionID, event, delivery });
+}
+function isRunning(context, sessionID) {
   const status = context.data.session.status;
-  if (typeof status !== "function") {
-    await delay2(250);
-    return true;
-  }
-  for (let attempt = 0;attempt < 50; attempt++) {
-    if (status.call(context.data.session, sessionID) !== "running")
-      return true;
-    await delay2(100);
-  }
-  return false;
+  return typeof status === "function" ? status.call(context.data.session, sessionID) === "running" : false;
 }
 function continuation(reason) {
   return `${AUTO_PERMISSIONS_MESSAGE_PREFIX} ${reason} Do not retry the exact blocked action. Continue the task using a safer alternative when possible; ask the user only if no useful safe path remains.`;
@@ -1492,9 +1500,6 @@ async function resumeLegacySession(api, sessionID, reason) {
       await client.session.prompt({ sessionID, text: continuation(reason), resume: true });
     }
   } catch {}
-}
-function delay2(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 export {
   tui_default as default,

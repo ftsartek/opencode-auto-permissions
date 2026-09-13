@@ -1,6 +1,8 @@
 import { Plugin } from "@opencode-ai/plugin/tui"
 import type { Context } from "@opencode-ai/plugin/tui/plugin"
 import { AUTO_PERMISSIONS_MESSAGE_PREFIX } from "./context.ts"
+import { parseConfig } from "./config.ts"
+import { describeError, writeDiagnostic } from "./diagnostics.ts"
 import { installReviewer } from "./reviewer.ts"
 import { protocolForVersion } from "./stable.ts"
 import type { RuntimeContext } from "./types.ts"
@@ -66,38 +68,54 @@ function fromContext(context: Context): RuntimeContext {
  * Writes the denial continuation into the main session so the coding agent
  * observes the block reason and keeps working. OpenCode V2 does not surface
  * the permission reject message to the agent on its own, so after replying we
- * wait for the agent loop to settle and admit a durable user prompt that
- * resumes the session with safer guidance.
+ * admit a durable user prompt carrying the reason and safer-continuation
+ * guidance. While the agent loop is still running the prompt is steered into
+ * the active run so the feedback lands mid-turn; when the session has gone
+ * idle it is admitted with resume so a fresh loop starts.
  */
 async function resumeV2Session(context: Context, sessionID: string, reason: string): Promise<void> {
+  const config = parseConfig(context.options)
   const client = context.client as unknown as {
     session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> }
   }
   const prompt = client?.session?.prompt
   if (typeof prompt !== "function") return
+  const text = continuation(reason)
+  const running = isRunning(context, sessionID)
   try {
-    if (!(await waitForIdle(context, sessionID))) return
     await prompt.call(client!.session, {
       sessionID,
-      text: continuation(reason),
-      resume: true,
+      text,
+      ...(running ? { delivery: "steer" } : { resume: true }),
     })
-  } catch {
-    // Resuming is best effort; the rejection itself already failed closed.
+    writeResume(config.diagnosticsPath, sessionID, "resumed", running ? "steer" : "resume")
+  } catch (error) {
+    try {
+      await prompt.call(client!.session, { sessionID, text, resume: true })
+      writeResume(config.diagnosticsPath, sessionID, "resumed", "resume_fallback")
+    } catch (fallbackError) {
+      writeDiagnostic(config.diagnosticsPath, {
+        timestamp: new Date().toISOString(),
+        sessionID,
+        event: "resume_failed",
+        errorMessage: describeError(fallbackError).message,
+      })
+    }
   }
 }
 
-async function waitForIdle(context: Context, sessionID: string): Promise<boolean> {
+function writeResume(
+  path: string | undefined,
+  sessionID: string,
+  event: "resumed",
+  delivery: "steer" | "resume" | "resume_fallback",
+): void {
+  writeDiagnostic(path, { timestamp: new Date().toISOString(), sessionID, event, delivery })
+}
+
+function isRunning(context: Context, sessionID: string): boolean {
   const status = (context.data.session as { status?: (sessionID: string) => string }).status
-  if (typeof status !== "function") {
-    await delay(250)
-    return true
-  }
-  for (let attempt = 0; attempt < 50; attempt++) {
-    if (status.call(context.data.session, sessionID) !== "running") return true
-    await delay(100)
-  }
-  return false
+  return typeof status === "function" ? status.call(context.data.session, sessionID) === "running" : false
 }
 
 function continuation(reason: string): string {
@@ -209,8 +227,4 @@ async function resumeLegacySession(api: LegacyTuiApi, sessionID: string, reason:
   } catch {
     // Resuming is best effort; the rejection itself already failed closed.
   }
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
