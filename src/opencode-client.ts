@@ -142,7 +142,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
         await this.client.permission.reply({
           sessionID: input.sessionID,
           requestID: input.requestID,
-          reply: input.reply,
+          decision: input.reply,
           ...(input.message ? { message: input.message } : {}),
         })
         return "replied"

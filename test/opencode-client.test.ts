@@ -44,7 +44,7 @@ describe("OpenCodeClientAdapter", () => {
       agent: "auto-permissions-reviewer",
       model: { providerID: "example", id: "luna-5.6" },
     })
-    expect(calls[3]?.input).toEqual({ sessionID: "ses_parent", requestID: "per_1", reply: "once" })
+    expect(calls[3]?.input).toEqual({ sessionID: "ses_parent", requestID: "per_1", decision: "once" })
   })
 
   test("prewarms the reviewer location without invoking a model", async () => {
