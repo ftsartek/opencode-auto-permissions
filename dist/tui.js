@@ -1,24 +1,5 @@
 // @bun
-var __defProp = Object.defineProperty;
-var __returnValue = (v) => v;
-function __exportSetter(name, newValue) {
-  this[name] = __returnValue.bind(null, newValue);
-}
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, {
-      get: all[name],
-      enumerable: true,
-      configurable: true,
-      set: __exportSetter.bind(all, name)
-    });
-};
-
 // node_modules/@opencode-ai/plugin/dist/tui/plugin.js
-var exports_plugin = {};
-__export(exports_plugin, {
-  define: () => define
-});
 function define(plugin) {
   return plugin;
 }
@@ -90,18 +71,18 @@ function children(fn) {
   };
   return memo;
 }
-function resolveChildren(children2) {
-  if (typeof children2 === "function" && !children2.length)
-    return resolveChildren(children2());
-  if (Array.isArray(children2)) {
+function resolveChildren(children) {
+  if (typeof children === "function" && !children.length)
+    return resolveChildren(children());
+  if (Array.isArray(children)) {
     const results = [];
-    for (let i = 0;i < children2.length; i++) {
-      const result = resolveChildren(children2[i]);
+    for (let i = 0;i < children.length; i++) {
+      const result = resolveChildren(children[i]);
       Array.isArray(result) ? results.push.apply(results, result) : results.push(result);
     }
     return results;
   }
-  return children2;
+  return children;
 }
 function createProvider(id) {
   return function provider(props) {
@@ -643,8 +624,8 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       const scoped = this.client.v2?.session?.permission ?? this.client.session?.permission;
       if (input.protocol === "v2" && typeof scoped?.reply === "function") {
         try {
-          const result2 = await scoped.reply(input);
-          throwForResultError(result2);
+          const result = await scoped.reply(input);
+          throwForResultError(result);
           return "replied";
         } catch (error) {
           if (!isNotFound(error) || typeof this.client.permission?.reply !== "function")
@@ -873,9 +854,9 @@ function parseDecision(value) {
     return null;
   if (typeof reasonCode !== "string" || !REASON_CODE.test(reasonCode))
     return null;
-  if (typeof reason !== "string" || !reason.trim() || reason.length > MAX_REASON_LENGTH)
+  if (typeof reason !== "string" || !reason.trim())
     return null;
-  return { kind: decision, reasonCode, reason };
+  return { kind: decision, reasonCode, reason: reason.slice(0, MAX_REASON_LENGTH) };
 }
 function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -995,13 +976,13 @@ async function reviewAndReply(context, client, config, request, parentSignal, ov
     return;
   if (decision.kind === "allow" || decision.kind === "allow_session") {
     const reply = decision.kind === "allow_session" && eligibleForSessionApproval(config, request, input) ? "always" : "once";
-    const result2 = await client.reply({
+    const result = await client.reply({
       sessionID: request.sessionID,
       requestID: request.id,
       reply,
       protocol: request.protocol
     });
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result2, reply === "always" ? "session" : "once");
+    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result, reply === "always" ? "session" : "once");
     return;
   }
   const result = await client.reply({
@@ -1130,23 +1111,79 @@ function cancelReview(config, inFlight, requestID) {
 }
 async function modelDecision(context, client, config, input, parentSignal) {
   const inheritedModel = input.context.model;
-  const model = config.model ?? (inheritedModel ? { ...inheritedModel, ...config.variant ? { variant: config.variant } : {} } : undefined);
-  if (!model)
+  const candidates = [];
+  if (config.model) {
+    candidates.push(config.model);
+    if (inheritedModel && !sameModelId(inheritedModel, config.model)) {
+      candidates.push(inheritedModel);
+    }
+  } else if (inheritedModel) {
+    candidates.push({ ...inheritedModel, ...config.variant ? { variant: config.variant } : {} });
+  }
+  if (candidates.length === 0)
     throw new Error("Auto Permissions could not determine the requesting session model");
+  let lastError;
+  for (const [index, model] of candidates.entries()) {
+    if (parentSignal.aborted)
+      throw new DOMException("Review cancelled", "AbortError");
+    const diagnostic = {
+      sessionID: input.context.rootSessionID,
+      providerID: model.providerID,
+      modelID: model.id,
+      ...model.variant ? { variant: model.variant } : {},
+      attempt: index + 1
+    };
+    writeDiagnostic(config.diagnosticsPath, {
+      ...diagnostic,
+      timestamp: new Date().toISOString(),
+      event: "model_attempt"
+    });
+    try {
+      const decision = await singleModelDecision(client, config, input, parentSignal, model);
+      writeDiagnostic(config.diagnosticsPath, {
+        ...diagnostic,
+        timestamp: new Date().toISOString(),
+        event: "model_decision",
+        decision: decision.kind
+      });
+      return decision;
+    } catch (error) {
+      if (parentSignal.aborted)
+        throw error;
+      writeDiagnostic(config.diagnosticsPath, {
+        ...diagnostic,
+        timestamp: new Date().toISOString(),
+        event: "model_failure",
+        failureCategory: failureCategory(error),
+        errorMessage: describeError(error).message
+      });
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+async function singleModelDecision(client, config, input, parentSignal, model) {
   const timeout = new AbortController;
   const timer = setTimeout(() => timeout.abort("review timed out"), config.timeoutMs);
   const abort = () => timeout.abort(parentSignal.reason);
   parentSignal.addEventListener("abort", abort, { once: true });
+  let rejectOnAbort;
+  const aborted = new Promise((_resolve, reject) => {
+    rejectOnAbort = () => reject(new DOMException("Review aborted", "AbortError"));
+    timeout.signal.addEventListener("abort", rejectOnAbort, { once: true });
+  });
   try {
+    if (parentSignal.aborted)
+      abort();
     let structured;
     try {
-      structured = await client.generate({
+      structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
         model,
         parentSessionID: input.context.rootSessionID,
         ...input.context.directory ? { location: { directory: input.context.directory } } : {},
         signal: timeout.signal
-      });
+      })]);
     } catch (error) {
       if (timeout.signal.aborted && !parentSignal.aborted)
         throw new Error("Permission review timed out");
@@ -1158,12 +1195,16 @@ async function modelDecision(context, client, config, input, parentSignal) {
     return decision;
   } finally {
     clearTimeout(timer);
+    timeout.signal.removeEventListener("abort", rejectOnAbort);
     parentSignal.removeEventListener("abort", abort);
   }
 }
+function sameModelId(left, right) {
+  return left.providerID === right.providerID && left.id === right.id;
+}
 
 // src/stable.ts
-function createStableRuntime(injectedClient, options, directory2) {
+function createStableRuntime(injectedClient, options, directory) {
   const client = compatibleClient(injectedClient);
   const listeners = new Map;
   const sessions = new Map;
@@ -1181,11 +1222,11 @@ function createStableRuntime(injectedClient, options, directory2) {
       handler(event);
   };
   const syncMessages = async (sessionID) => {
-    const result = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory: directory2, limit: 200 } }));
+    const result = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory, limit: 200 } }));
     messages.set(sessionID, Array.isArray(result) ? result : []);
   };
   const syncPermissions = async () => {
-    const result = unwrap(await client.permission.list({ directory: directory2 }));
+    const result = unwrap(await client.permission.list({ directory }));
     if (!Array.isArray(result))
       return;
     pending.clear();
@@ -1202,7 +1243,7 @@ function createStableRuntime(injectedClient, options, directory2) {
       seen.add(current);
       let session = sessions.get(current);
       if (!session) {
-        const result = unwrap(await client.session.get({ path: { id: current }, query: { directory: directory2 } }));
+        const result = unwrap(await client.session.get({ path: { id: current }, query: { directory } }));
         if (!isRecord4(result) || typeof result.id !== "string")
           return sessionID;
         session = {
@@ -1237,13 +1278,13 @@ function createStableRuntime(injectedClient, options, directory2) {
           })
         }
       },
-      location: { default: () => ({ directory: directory2 }) }
+      location: { default: () => ({ directory }) }
     },
-    location: { directory: directory2 },
+    location: { directory },
     showToast(input) {
       if (typeof client.tui?.showToast !== "function")
         return;
-      client.tui.showToast({ directory: directory2, ...input }).catch(() => {
+      client.tui.showToast({ directory, ...input }).catch(() => {
         return;
       });
     },
@@ -1252,13 +1293,13 @@ function createStableRuntime(injectedClient, options, directory2) {
         return;
       const controller = new AbortController;
       resumeControllers.add(controller);
-      waitForIdle(client, sessionID, directory2, controller.signal).then((idle) => {
+      waitForIdle(client, sessionID, directory, controller.signal).then((idle) => {
         if (!idle || controller.signal.aborted)
           return;
         const routing = latestUserRouting(messages.get(sessionID) ?? []);
         return client.session.promptAsync({
           path: { id: sessionID },
-          query: { directory: directory2 },
+          query: { directory },
           body: {
             ...routing,
             parts: [{
@@ -1326,13 +1367,13 @@ function latestUserRouting(messages) {
   }
   return {};
 }
-async function waitForIdle(client, sessionID, directory2, signal) {
+async function waitForIdle(client, sessionID, directory, signal) {
   if (typeof client.session?.status !== "function") {
     await delay(250, signal);
     return !signal.aborted;
   }
   for (let attempt = 0;attempt < 50 && !signal.aborted; attempt++) {
-    const statuses = unwrap(await client.session.status({ query: { directory: directory2 } }));
+    const statuses = unwrap(await client.session.status({ query: { directory } }));
     if (!isRecord4(statuses) || !isRecord4(statuses[sessionID]) || statuses[sessionID].type === "idle")
       return true;
     await delay(100, signal);
@@ -1383,11 +1424,11 @@ function isRecord4(value) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.2.14";
+var PLUGIN_VERSION = "0.2.15";
 
 // src/tui.ts
 var id = "opencode.auto-permissions";
-var plugin = exports_plugin.define({
+var plugin = define({
   id,
   setup(context) {
     return installReviewer(fromContext(context), { protocols: ["v2"] });

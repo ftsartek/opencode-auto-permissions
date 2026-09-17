@@ -12,6 +12,7 @@ import type {
   Decision,
   PermissionProtocol,
   PermissionRequest,
+  ReviewModel,
   ReviewerClient,
   RuntimeContext,
 } from "./types.ts"
@@ -343,25 +344,85 @@ async function modelDecision(
   parentSignal: AbortSignal,
 ): Promise<Decision> {
   const inheritedModel = input.context.model
-  const model = config.model ?? (inheritedModel
-    ? { ...inheritedModel, ...(config.variant ? { variant: config.variant } : {}) }
-    : undefined)
-  if (!model) throw new Error("Auto Permissions could not determine the requesting session model")
+  const candidates: ReviewModel[] = []
+  if (config.model) {
+    candidates.push(config.model)
+    if (inheritedModel && !sameModelId(inheritedModel, config.model)) {
+      // Reviewer-only variants may not exist on the session's provider.
+      candidates.push(inheritedModel)
+    }
+  } else if (inheritedModel) {
+    candidates.push({ ...inheritedModel, ...(config.variant ? { variant: config.variant } : {}) })
+  }
+  if (candidates.length === 0) throw new Error("Auto Permissions could not determine the requesting session model")
+
+  let lastError: unknown
+  for (const [index, model] of candidates.entries()) {
+    if (parentSignal.aborted) throw new DOMException("Review cancelled", "AbortError")
+    const diagnostic = {
+      sessionID: input.context.rootSessionID,
+      providerID: model.providerID,
+      modelID: model.id,
+      ...(model.variant ? { variant: model.variant } : {}),
+      attempt: index + 1,
+    }
+    writeDiagnostic(config.diagnosticsPath, {
+      ...diagnostic, timestamp: new Date().toISOString(), event: "model_attempt",
+    })
+    try {
+      const decision = await singleModelDecision(client, config, input, parentSignal, model)
+      writeDiagnostic(config.diagnosticsPath, {
+        ...diagnostic, timestamp: new Date().toISOString(), event: "model_decision", decision: decision.kind,
+      })
+      return decision
+    } catch (error) {
+      // A cancelled review must not trigger a fallback review.
+      if (parentSignal.aborted) throw error
+      writeDiagnostic(config.diagnosticsPath, {
+        ...diagnostic, timestamp: new Date().toISOString(), event: "model_failure",
+        failureCategory: failureCategory(error), errorMessage: describeError(error).message,
+      })
+      lastError = error
+    }
+  }
+  throw lastError
+}
+
+/**
+ * Tries the dedicated reviewer model first and falls back to the requesting
+ * session's model once when that model times out, errors, or returns an
+ * invalid decision. A valid deny verdict is authoritative and never retried
+ * on another model. Each attempt receives the full timeout budget so a slow
+ * primary does not consume the fallback's window.
+ */
+async function singleModelDecision(
+  client: ReviewerClient,
+  config: Config,
+  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  parentSignal: AbortSignal,
+  model: ReviewModel,
+): Promise<Decision> {
   const timeout = new AbortController()
   const timer = setTimeout(() => timeout.abort("review timed out"), config.timeoutMs)
   const abort = () => timeout.abort(parentSignal.reason)
   parentSignal.addEventListener("abort", abort, { once: true })
+  let rejectOnAbort!: () => void
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectOnAbort = () => reject(new DOMException("Review aborted", "AbortError"))
+    timeout.signal.addEventListener("abort", rejectOnAbort, { once: true })
+  })
 
   try {
+    if (parentSignal.aborted) abort()
     let structured: unknown
     try {
-      structured = await client.generate({
+      structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
         model,
         parentSessionID: input.context.rootSessionID,
         ...(input.context.directory ? { location: { directory: input.context.directory } } : {}),
         signal: timeout.signal,
-      })
+      })])
     } catch (error) {
       if (timeout.signal.aborted && !parentSignal.aborted) throw new Error("Permission review timed out")
       throw error
@@ -371,6 +432,11 @@ async function modelDecision(
     return decision
   } finally {
     clearTimeout(timer)
+    timeout.signal.removeEventListener("abort", rejectOnAbort)
     parentSignal.removeEventListener("abort", abort)
   }
+}
+
+function sameModelId(left: ReviewModel, right: ReviewModel): boolean {
+  return left.providerID === right.providerID && left.id === right.id
 }

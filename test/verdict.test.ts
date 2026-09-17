@@ -14,6 +14,15 @@ describe("parseDecision", () => {
     ).toEqual({ kind: "allow_session", reasonCode: "repeatable_read", reason: "Safe for this session." })
   })
 
+  test("truncates an over-long reason at the boundary", () => {
+    const decision = parseDecision({
+      decision: "allow",
+      reasonCode: "x",
+      reason: "a".repeat(300),
+    })
+    expect(decision?.reason.length).toBe(240)
+  })
+
   test.each([
     "",
     null,

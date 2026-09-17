@@ -11,6 +11,9 @@ export interface DiagnosticRecord {
   event:
     | "plugin_started"
     | "plugin_environment"
+    | "model_attempt"
+    | "model_failure"
+    | "model_decision"
     | "request_received"
     | "request_cancelled"
     | "decision"
@@ -38,6 +41,10 @@ export interface DiagnosticRecord {
   errorCode?: string | number
   errorStatus?: string | number
   version?: string
+  providerID?: string
+  modelID?: string
+  variant?: string
+  attempt?: number
   clientCapabilities?: string[]
 }
 

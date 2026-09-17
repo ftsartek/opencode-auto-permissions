@@ -154,6 +154,110 @@ describe("installReviewer", () => {
     dispose()
   })
 
+  test.each(["provider error", "timeout", "invalid output"])("falls back to the session model after a reviewer %s", async (failure) => {
+    const app = harness({ model: "reviewer/fast", variant: "reviewer-only", timeoutMs: 100 })
+    const models: Parameters<ReviewerClient["generate"]>[0]["model"][] = []
+    const signals: AbortSignal[] = []
+    app.client.generate = async ({ model, signal }) => {
+      models.push(model)
+      signals.push(signal)
+      if (model.providerID === "reviewer") {
+        if (failure === "invalid output") return { decision: "allow" }
+        if (failure === "timeout") {
+          await new Promise<void>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true })
+          })
+        }
+        throw new Error("provider unavailable")
+      }
+      return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+    }
+    app.requests.push(request("git push origin feature"))
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", app.requests[0])
+      await new Promise((resolve) => setTimeout(resolve, failure === "timeout" ? 150 : 20))
+      expect(models).toEqual([
+        { providerID: "reviewer", id: "fast", variant: "reviewer-only" },
+        { providerID: "example", id: "main" },
+      ])
+      expect(signals[1]).not.toBe(signals[0])
+      expect(signals[1]?.aborted).toBe(false)
+      expect(app.replies.map((reply) => reply.reply)).toEqual(["once"])
+      expect(app.resumptions).toEqual([])
+    } finally {
+      dispose()
+    }
+  })
+
+  test.each(["deny", "same model", "no configured model", "missing session model", "disposed"])("does not fall back for %s", async (scenario) => {
+    const app = harness(scenario === "no configured model" ? {} : {
+      model: scenario === "same model" ? "example/main" : "reviewer/fast",
+    })
+    if (scenario === "missing session model") app.context.data.session.message.list = () => []
+    let calls = 0
+    let fail!: () => void
+    app.client.generate = async () => {
+      calls++
+      if (scenario === "deny") return { decision: "deny", reasonCode: "not_authorized", reason: "Not authorized." }
+      if (scenario === "disposed") await new Promise<void>((_resolve, reject) => { fail = () => reject(new Error("cancelled")) })
+      throw new Error("provider unavailable")
+    }
+    app.requests.push(request("git push origin feature"))
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", app.requests[0])
+      await settle()
+      if (scenario === "disposed") {
+        dispose()
+        fail()
+        await settle()
+      }
+      expect(calls).toBe(1)
+      expect(app.replies.map((reply) => reply.reply)).toEqual(scenario === "disposed" ? [] : ["reject"])
+    } finally {
+      dispose()
+    }
+  })
+
+  test("falls back even when the primary ignores its abort signal", async () => {
+    const app = harness({ model: "reviewer/fast", timeoutMs: 100 })
+    let calls = 0
+    app.client.generate = async () => {
+      if (++calls === 1) return await new Promise(() => {})
+      return { decision: "allow", reasonCode: "requested_action", reason: "The user requested this action." }
+    }
+    app.requests.push(request("git push origin feature"))
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", app.requests[0])
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      expect(calls).toBe(2)
+      expect(app.replies.map((reply) => reply.reply)).toEqual(["once"])
+    } finally {
+      dispose()
+    }
+  })
+
+  test("truncates an over-long reviewer reason instead of failing the review", async () => {
+    const app = harness({ model: "reviewer/fast" })
+    app.client.generate = async () => ({
+      decision: "allow",
+      reasonCode: "requested_action",
+      reason: "The requested action is reasonable. ".repeat(10),
+    })
+    app.requests.push(request("git push origin feature"))
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", app.requests[0])
+      await settle()
+      expect(app.replies.map((reply) => reply.reply)).toEqual(["once"])
+      expect(app.resumptions).toEqual([])
+    } finally {
+      dispose()
+    }
+  })
+
   test("silently approves a deterministic safe command once", async () => {
     const app = harness()
     app.requests.push(request("pnpm test"))
@@ -369,7 +473,7 @@ describe("installReviewer", () => {
     })
 
     app.emit("permission.v2.asked", app.requests[0])
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await new Promise((resolve) => setTimeout(resolve, 250))
 
     expect(app.replies[0]).toMatchObject({ reply: "reject", message: expect.stringContaining("timed out") })
     expect(app.requests).toHaveLength(0)
@@ -406,7 +510,7 @@ describe("installReviewer", () => {
     const dispose = installReviewer(app.context, { client: app.client })
 
     app.emit("permission.v2.asked", app.requests[0])
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await new Promise((resolve) => setTimeout(resolve, 250))
 
     expect(app.replies[0]?.message).toContain("review timed out")
     expect(app.resumptions[0]?.reason).toContain("timed out")
