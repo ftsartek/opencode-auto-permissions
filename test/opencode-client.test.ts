@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { OpenCodeClientAdapter } from "../src/opencode-client.ts"
+import { OpenCodeClientAdapter, ServerContextClient } from "../src/opencode-client.ts"
 
 describe("OpenCodeClientAdapter", () => {
   test("uses the current V2 session and permission APIs", async () => {
@@ -455,5 +455,120 @@ describe("OpenCodeClientAdapter", () => {
     await client.reply({ sessionID: "ses_1", requestID: "per_1", reply: "once", protocol: "stable" })
 
     expect(calls).toEqual([{ path: { id: "ses_1", permissionID: "per_1" }, body: { response: "once" } }])
+  })
+})
+
+describe("ServerContextClient", () => {
+  function serverContext() {
+    const calls: Array<{ method: string; input: any }> = []
+    let created = 0
+    const deleted = new Set<string>()
+    const context = {
+      location: { directory: "/repo" },
+      permission: {
+        list: async () => [],
+        reply: async (input: any) => {
+          calls.push({ method: "reply", input })
+          if (input.requestID === "per_gone") throw new Error("Permission request not found: per_gone")
+        },
+      },
+      session: {
+        create: async (input: any) => {
+          calls.push({ method: "create", input })
+          created++
+          return { id: `ses_review_${created}` }
+        },
+        generate: async (input: any) => {
+          calls.push({ method: "generate", input })
+          if (deleted.has(input.sessionID)) throw Object.assign(new Error("Session not found"), { _tag: "SessionNotFoundError" })
+          return { text: '{"decision":"allow","reasonCode":"safe","reason":"Safe operation."}' }
+        },
+        interrupt: async (input: any) => calls.push({ method: "interrupt", input }),
+        get: async () => undefined,
+        context: async () => [],
+        prompt: async () => {},
+      },
+    }
+    return { context, calls, deleted }
+  }
+  const model = { providerID: "example", id: "luna-5.6" }
+  const signal = () => new AbortController().signal
+
+  test("reuses one reviewer session per model in the plugin's own location", async () => {
+    const { context, calls } = serverContext()
+    const client = new ServerContextClient(context)
+
+    await client.generate({ prompt: "first", model, parentSessionID: "ses_parent", signal: signal() })
+    await client.generate({ prompt: "second", model, parentSessionID: "ses_parent", signal: signal() })
+    await client.generate({ prompt: "third", model: { ...model, variant: "low" }, parentSessionID: "ses_parent", signal: signal() })
+
+    expect(calls.map((call) => call.method)).toEqual(["create", "generate", "generate", "create", "generate"])
+    expect(calls[0]?.input).toMatchObject({
+      agent: "auto-permissions-reviewer",
+      model: { providerID: "example", id: "luna-5.6" },
+      location: { directory: "/repo" },
+    })
+    expect(calls[3]?.input.model).toEqual({ providerID: "example", id: "luna-5.6", variant: "low" })
+    expect(calls[1]?.input.prompt).toContain("Return only one JSON object")
+  })
+
+  test("recreates the reviewer session once when it has disappeared", async () => {
+    const { context, calls, deleted } = serverContext()
+    const client = new ServerContextClient(context)
+    await client.generate({ prompt: "first", model, parentSessionID: "ses_parent", signal: signal() })
+    deleted.add("ses_review_1")
+
+    await expect(client.generate({ prompt: "second", model, parentSessionID: "ses_parent", signal: signal() }))
+      .resolves.toEqual({ decision: "allow", reasonCode: "safe", reason: "Safe operation." })
+
+    expect(calls.map((call) => call.method)).toEqual(["create", "generate", "generate", "create", "generate"])
+    expect(calls[4]?.input.sessionID).toBe("ses_review_2")
+  })
+
+  test("replies with the decision field and maps a lost race to not_found", async () => {
+    const { context, calls } = serverContext()
+    const client = new ServerContextClient(context)
+
+    await expect(client.reply({ sessionID: "ses_root", requestID: "per_1", reply: "reject", message: "No.", protocol: "v2" }))
+      .resolves.toBe("replied")
+    await expect(client.reply({ sessionID: "ses_root", requestID: "per_gone", reply: "once", protocol: "v2" }))
+      .resolves.toBe("not_found")
+
+    expect(calls[0]?.input).toEqual({ sessionID: "ses_root", requestID: "per_1", decision: "reject", message: "No." })
+  })
+
+  test("announces each reply through the hook and releases it on failure", async () => {
+    const { context } = serverContext()
+    const announced: string[] = []
+    const released: string[] = []
+    const client = new ServerContextClient(context, {
+      onReply: (requestID) => {
+        announced.push(requestID)
+        return () => released.push(requestID)
+      },
+    })
+
+    await client.reply({ sessionID: "ses_root", requestID: "per_1", reply: "once", protocol: "v2" })
+    await client.reply({ sessionID: "ses_root", requestID: "per_gone", reply: "once", protocol: "v2" })
+
+    expect(announced).toEqual(["per_1", "per_gone"])
+    expect(released).toEqual(["per_gone"])
+  })
+
+  test("interrupts the reviewer session when a review is aborted", async () => {
+    const { context, calls } = serverContext()
+    context.session.generate = async (input: any) => {
+      calls.push({ method: "generate", input })
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      return { text: '{"decision":"allow","reasonCode":"safe","reason":"Safe."}' }
+    }
+    const client = new ServerContextClient(context)
+    const controller = new AbortController()
+    const pending = client.generate({ prompt: "slow", model, parentSessionID: "ses_parent", signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    controller.abort("timed out")
+    await pending.catch(() => undefined)
+
+    expect(calls.some((call) => call.method === "interrupt" && call.input.sessionID === "ses_review_1")).toBe(true)
   })
 })

@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-108%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-128%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -25,7 +25,7 @@ That is the complete plugin installation. You do not need to clone this reposito
 
 OpenCode downloads the package, detects its separate server and TUI targets, and registers `opencode-auto-permissions` in your global plugin configuration (`~/.config/opencode/opencode.json` on current builds; older V2 betas also added a TUI entry to `~/.config/opencode/cli.json`).
 
-Quit and restart OpenCode after installation because configuration is loaded at startup. Auto Permissions automatically uses the model and variant selected by the session that requested the action. It also detects whether the server or TUI integration owns permission review, so only one reviewer handles each request.
+Quit and restart OpenCode after installation because configuration is loaded at startup. Auto Permissions automatically uses the model and variant selected by the session that requested the action. It also detects whether the server or TUI integration owns permission review, so only one reviewer handles each request. On released OpenCode 2.x builds the server owns review, so web, headless, and TUI sessions are all covered; the TUI stands down when it can see the server plugin active.
 
 ## Configure Permissions
 
@@ -163,7 +163,9 @@ The compatibility baseline was acceptance-tested in the real TUI with:
 - OpenCode stable `1.18.12`
 - OpenCode V2 `0.0.0-beta-202608110357`
 
-Newer V2 builds (September 2026 and later) renamed the permission event payloads (`permission.v2.asked` back to `permission.asked`, and the reusable-pattern field from `always` to `save`); the plugin accepts both shapes. The runtime protocol is detected automatically; stable permission events are handled by the server adapter and V2 events by the TUI adapter. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
+Server-side V2 review was verified headless on OpenCode `2.0.12`, registered as `"plugin": ["file:/path/to/checkout"]`.
+
+Newer V2 builds (September 2026 and later) renamed the permission event payloads (`permission.v2.asked` back to `permission.asked`, and the reusable-pattern field from `always` to `save`); the plugin accepts both shapes. The runtime protocol is detected automatically. Stable permission events are handled by the server adapter. On released 2.x builds the server adapter also handles V2 events, so review does not depend on a TUI being attached; on V2 betas the TUI adapter handles them. OpenCode's free-tier models refuse requests from the hidden reviewer agent, so configure a real provider for the reviewer. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
 
 ## Development
 

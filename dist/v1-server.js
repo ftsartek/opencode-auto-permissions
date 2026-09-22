@@ -8263,6 +8263,7 @@ var Resolved = durable({
 var Event14 = { Updated: Updated10, Resolved, Definitions: inventory(Updated10, Resolved) };
 // src/agent.ts
 var REVIEWER_AGENT_ID = "auto-permissions-reviewer";
+var SERVER_PLUGIN_ID = "opencode.auto-permissions.server";
 var DECISION_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -8669,10 +8670,7 @@ Example: {"decision":"allow","reasonCode":"authorized_action","reason":"The acti
       if (!isRecord(session) || typeof session.id !== "string")
         throw new Error("OpenCode failed to create a reviewer session");
       sessionID = session.id;
-      const strictPrompt = `${input.prompt}
-
-Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
-      const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal });
+      const result = await this.client.session.generate({ sessionID, prompt: strictJsonPrompt(input.prompt) }, { signal: input.signal });
       if (!isRecord(result) || typeof result.text !== "string")
         throw new Error("OpenCode reviewer returned no text output");
       return JSON.parse(result.text);
@@ -8684,6 +8682,91 @@ Return only one JSON object without Markdown fences with exactly these keys: "de
         });
     }
   }
+}
+
+class ServerContextClient {
+  context;
+  hooks;
+  sessions = new Map;
+  constructor(context, hooks = {}) {
+    this.context = context;
+    this.hooks = hooks;
+  }
+  async generate(input) {
+    const key = `${input.model.providerID}/${input.model.id}/${input.model.variant ?? ""}`;
+    let sessionID = this.sessions.get(key) ?? await this.createSession(key, input.model, input.signal);
+    const abortRemote = () => {
+      Promise.resolve(this.context.session.interrupt({ sessionID })).catch(() => {
+        return;
+      });
+    };
+    input.signal.addEventListener("abort", abortRemote, { once: true });
+    try {
+      if (input.signal.aborted)
+        throw abortError(input.signal.reason);
+      const prompt = strictJsonPrompt(input.prompt);
+      let result;
+      try {
+        result = await this.context.session.generate({ sessionID, prompt }, { signal: input.signal });
+      } catch (error) {
+        if (!isSessionNotFound(error))
+          throw error;
+        this.sessions.delete(key);
+        sessionID = await this.createSession(key, input.model, input.signal);
+        result = await this.context.session.generate({ sessionID, prompt }, { signal: input.signal });
+      }
+      const value = unwrapData(result);
+      if (!isRecord(value) || typeof value.text !== "string")
+        throw new Error("OpenCode reviewer returned no text output");
+      return JSON.parse(value.text);
+    } finally {
+      input.signal.removeEventListener("abort", abortRemote);
+    }
+  }
+  async reply(input) {
+    const release = this.hooks.onReply?.(input.requestID);
+    try {
+      await this.context.permission.reply({
+        sessionID: input.sessionID,
+        requestID: input.requestID,
+        decision: input.reply,
+        ...input.message ? { message: input.message } : {}
+      });
+      return "replied";
+    } catch (error) {
+      release?.();
+      if (isNotFound(error))
+        return "not_found";
+      throw error;
+    }
+  }
+  async createSession(key, model, signal) {
+    const created = unwrapData(await this.context.session.create({
+      title: REVIEWER_SESSION_TITLE,
+      agent: REVIEWER_AGENT_ID,
+      model: { providerID: model.providerID, id: model.id, ...model.variant ? { variant: model.variant } : {} },
+      location: this.context.location,
+      metadata: { source: "opencode-auto-permissions" }
+    }, { signal }));
+    if (!isRecord(created) || typeof created.id !== "string") {
+      throw new Error("OpenCode failed to create a reviewer session");
+    }
+    this.sessions.set(key, created.id);
+    return created.id;
+  }
+}
+function strictJsonPrompt(prompt) {
+  return `${prompt}
+
+Return only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`;
+}
+function isSessionNotFound(error) {
+  if (!isRecord(error))
+    return false;
+  const tag = error._tag ?? error.name;
+  if (tag === "SessionNotFoundError" || tag === "Session.NotFoundError")
+    return true;
+  return typeof error.message === "string" && /session not found/i.test(error.message);
 }
 function assistantStructured(value) {
   if (!isRecord(value))
@@ -8736,7 +8819,9 @@ function isNotFound(error) {
   if (status === 404)
     return true;
   const tag = error._tag ?? error.name;
-  return tag === "PermissionNotFoundError" || tag === "Permission.NotFoundError";
+  if (tag === "PermissionNotFoundError" || tag === "Permission.NotFoundError")
+    return true;
+  return typeof error.message === "string" && /permission request not found/i.test(error.message);
 }
 function abortError(reason) {
   return new DOMException(typeof reason === "string" ? reason : "Review aborted", "AbortError");
@@ -8748,6 +8833,9 @@ function isRecord(value) {
 // src/context.ts
 var MAX_MESSAGE_CHARS = 4000;
 var AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:";
+function denialContinuation(reason) {
+  return `${AUTO_PERMISSIONS_MESSAGE_PREFIX} ${reason} Do not retry the exact blocked action. Continue the task using a safer alternative when possible; ask the user only if no useful safe path remains.`;
+}
 function normalizeAskedEvent(event) {
   if (!isRecord2(event))
     return null;
@@ -9561,6 +9649,11 @@ function protocolForVersion(version) {
     return;
   return major >= 2 ? "v2" : "stable";
 }
+function releasedV2Runtime(version) {
+  if (!version || version.startsWith("0.0.0-"))
+    return false;
+  return protocolForVersion(version) === "v2";
+}
 function compatibleClient(value) {
   if (isRecord4(value))
     return value;
@@ -9585,9 +9678,271 @@ function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// src/server-runtime.ts
+var REQUIRED_CAPABILITIES = [
+  "event.subscribe",
+  "permission.list",
+  "permission.reply",
+  "session.create",
+  "session.get",
+  "session.context",
+  "session.generate",
+  "session.prompt"
+];
+var RUNNING_STARTED = new Set(["session.execution.started"]);
+var RUNNING_ENDED = new Set([
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.cancelled",
+  "session.execution.ended",
+  "session.idle"
+]);
+var RESUBSCRIBE_DELAY_MS = 1000;
+function serverReviewCapabilities(context) {
+  const value = context;
+  const present = [];
+  const probe = (name, fn) => {
+    if (typeof fn === "function")
+      present.push(name);
+  };
+  probe("event.subscribe", value?.event?.subscribe);
+  probe("permission.list", value?.permission?.list);
+  probe("permission.reply", value?.permission?.reply);
+  probe("session.create", value?.session?.create);
+  probe("session.get", value?.session?.get);
+  probe("session.context", value?.session?.context);
+  probe("session.generate", value?.session?.generate);
+  probe("session.interrupt", value?.session?.interrupt);
+  probe("session.prompt", value?.session?.prompt);
+  return present;
+}
+function canOwnServerReview(capabilities, version) {
+  if (!releasedV2Runtime(version))
+    return false;
+  return REQUIRED_CAPABILITIES.every((capability) => capabilities.includes(capability));
+}
+function createServerRuntime(context) {
+  const config = parseConfig(context.options);
+  const listeners = new Map;
+  const sessions = new Map;
+  const messages = new Map;
+  const pending = new Map;
+  const running = new Set;
+  const ownReplies = new Set;
+  const controller = new AbortController;
+  const on = (type, handler) => {
+    const handlers = listeners.get(type) ?? new Set;
+    handlers.add(handler);
+    listeners.set(type, handlers);
+    return () => handlers.delete(handler);
+  };
+  const dispatch = (type, event) => {
+    for (const handler of listeners.get(type) ?? [])
+      handler(event);
+  };
+  const handle = (event) => {
+    if (!isRecord5(event) || typeof event.type !== "string")
+      return;
+    const directory = isRecord5(event.location) ? event.location.directory : undefined;
+    if (typeof directory === "string" && directory !== context.location.directory)
+      return;
+    const data = isRecord5(event.data) ? event.data : undefined;
+    const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
+    if (RUNNING_STARTED.has(event.type) && sessionID)
+      running.add(sessionID);
+    if (RUNNING_ENDED.has(event.type) && sessionID)
+      running.delete(sessionID);
+    if (event.type === "session.deleted" && sessionID) {
+      sessions.delete(sessionID);
+      messages.delete(sessionID);
+      running.delete(sessionID);
+    }
+    const asked = normalizeAskedEvent(event);
+    if (asked) {
+      pending.set(asked.id, asked);
+      dispatch("permission.asked", event);
+      return;
+    }
+    const replied = normalizeRepliedEvent(event);
+    if (replied) {
+      pending.delete(replied.requestID);
+      if (ownReplies.delete(replied.requestID))
+        return;
+      dispatch("permission.replied", event);
+    }
+  };
+  const pump = async () => {
+    while (!controller.signal.aborted) {
+      try {
+        for await (const event of context.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted)
+            return;
+          handle(event);
+        }
+      } catch (error) {
+        if (controller.signal.aborted)
+          return;
+        writeDiagnostic(config.diagnosticsPath, {
+          timestamp: new Date().toISOString(),
+          event: "event_stream_restarted",
+          errorMessage: describeError(error).message
+        });
+      }
+      if (controller.signal.aborted)
+        return;
+      writeDiagnostic(config.diagnosticsPath, { timestamp: new Date().toISOString(), event: "event_stream_restarted" });
+      await delay3(RESUBSCRIBE_DELAY_MS, controller.signal);
+    }
+  };
+  pump();
+  const root = async (sessionID) => {
+    const seen = new Set;
+    let current = sessionID;
+    while (!seen.has(current)) {
+      seen.add(current);
+      let session = sessions.get(current);
+      if (!session) {
+        const result = unwrap2(await context.session.get({ sessionID: current }).catch(() => {
+          return;
+        }));
+        if (!isRecord5(result) || typeof result.id !== "string")
+          return sessionID;
+        session = {
+          id: result.id,
+          ...typeof result.parentID === "string" ? { parentID: result.parentID } : {}
+        };
+        sessions.set(current, session);
+      }
+      if (!session.parentID)
+        return current;
+      current = session.parentID;
+    }
+    return sessionID;
+  };
+  const syncMessages = async (sessionID) => {
+    const result = unwrap2(await context.session.context({ sessionID }));
+    messages.set(sessionID, Array.isArray(result) ? result : []);
+  };
+  const syncPermissions = async (sessionID) => {
+    const result = unwrap2(await context.permission.list({ sessionID }));
+    if (!Array.isArray(result))
+      return;
+    for (const [id, request] of pending) {
+      if (request.sessionID === sessionID)
+        pending.delete(id);
+    }
+    for (const value of result) {
+      const request = normalizeAskedEvent({ type: "permission.asked", data: value });
+      if (request)
+        pending.set(request.id, request);
+    }
+  };
+  const resume = async (sessionID, reason) => {
+    const text = denialContinuation(reason);
+    const delivery = running.has(sessionID) ? "steer" : "queue";
+    try {
+      await context.session.prompt({ sessionID, text, delivery });
+      writeResume(config.diagnosticsPath, sessionID, delivery);
+    } catch (error) {
+      if (delivery === "queue") {
+        writeResumeFailed(config.diagnosticsPath, sessionID, error);
+        return;
+      }
+      try {
+        await context.session.prompt({ sessionID, text, delivery: "queue" });
+        writeResume(config.diagnosticsPath, sessionID, "queue");
+      } catch (fallbackError) {
+        writeResumeFailed(config.diagnosticsPath, sessionID, fallbackError);
+      }
+    }
+  };
+  const runtime = {
+    options: context.options,
+    client: context,
+    data: {
+      on,
+      session: {
+        root,
+        get: (sessionID) => sessions.get(sessionID),
+        message: {
+          list: (sessionID) => messages.get(sessionID) ?? [],
+          get: (sessionID, messageID) => (messages.get(sessionID) ?? []).find((message) => messageIDOf2(message) === messageID),
+          sync: syncMessages
+        },
+        permission: {
+          list: (sessionID) => [...pending.values()].filter((request) => request.sessionID === sessionID),
+          sync: async (sessionID) => syncPermissions(sessionID).catch(() => {
+            return;
+          })
+        }
+      },
+      location: { default: () => context.location }
+    },
+    location: context.location,
+    resumeAfterDenial(sessionID, reason) {
+      resume(sessionID, reason);
+    }
+  };
+  return {
+    runtime,
+    expectOwnReply(requestID) {
+      ownReplies.add(requestID);
+      return () => ownReplies.delete(requestID);
+    },
+    dispose() {
+      controller.abort("plugin disposed");
+      listeners.clear();
+      sessions.clear();
+      messages.clear();
+      pending.clear();
+      running.clear();
+      ownReplies.clear();
+    }
+  };
+}
+function writeResume(path, sessionID, delivery) {
+  writeDiagnostic(path, { timestamp: new Date().toISOString(), sessionID, event: "resumed", delivery });
+}
+function writeResumeFailed(path, sessionID, error) {
+  writeDiagnostic(path, {
+    timestamp: new Date().toISOString(),
+    sessionID,
+    event: "resume_failed",
+    errorMessage: describeError(error).message
+  });
+}
+function messageIDOf2(message) {
+  if (!isRecord5(message))
+    return;
+  if (typeof message.id === "string")
+    return message.id;
+  return isRecord5(message.info) && typeof message.info.id === "string" ? message.info.id : undefined;
+}
+function delay3(milliseconds, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+function unwrap2(result) {
+  let value = result;
+  for (let depth = 0;depth < 3 && isRecord5(value) && "data" in value; depth++)
+    value = value.data;
+  return value;
+}
+function isRecord5(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// src/version.ts
+var PLUGIN_VERSION = "0.2.15";
+
 // src/server.ts
 var v2Plugin = define({
-  id: "opencode.auto-permissions.server",
+  id: SERVER_PLUGIN_ID,
   async setup(context) {
     const config = parseConfig(context.options);
     await context.agent.transform((draft) => {
@@ -9602,8 +9957,31 @@ var v2Plugin = define({
         agent.permissions = [{ action: "*", resource: "*", effect: "deny" }];
       });
     });
+    return installServerReviewer(context);
   }
 });
+function installServerReviewer(context) {
+  const config = parseConfig(context.options);
+  const capabilities = serverReviewCapabilities(context);
+  const owns = canOwnServerReview(capabilities, context.app?.version);
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    event: "plugin_environment",
+    version: PLUGIN_VERSION,
+    owner: owns ? "server" : "tui",
+    serverCapabilities: capabilities,
+    ...context.app?.version ? { runtimeVersion: context.app.version } : {}
+  });
+  if (!owns)
+    return;
+  const { runtime, expectOwnReply, dispose } = createServerRuntime(context);
+  const client = new ServerContextClient(context, { onReply: expectOwnReply });
+  const stop = installReviewer(runtime, { client, protocols: ["v2"] });
+  return () => {
+    stop();
+    dispose();
+  };
+}
 var legacyPlugin = async (input, options = {}) => {
   const config = parseConfig(options);
   const reviewerSessions = new Map;

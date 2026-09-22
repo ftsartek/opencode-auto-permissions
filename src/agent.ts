@@ -1,4 +1,5 @@
 export const REVIEWER_AGENT_ID = "auto-permissions-reviewer"
+export const SERVER_PLUGIN_ID = "opencode.auto-permissions.server"
 
 export const DECISION_SCHEMA = {
   type: "object",

@@ -1,4 +1,5 @@
 import type { ReviewModel, ReviewerClient } from "./types.ts"
+import type { ServerPluginContext } from "./server-runtime.ts"
 import { DECISION_SCHEMA, REVIEWER_AGENT_ID } from "./agent.ts"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -196,8 +197,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       }, { signal: input.signal })
       if (!isRecord(session) || typeof session.id !== "string") throw new Error("OpenCode failed to create a reviewer session")
       sessionID = session.id
-      const strictPrompt = `${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
-      const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal })
+      const result = await this.client.session.generate({ sessionID, prompt: strictJsonPrompt(input.prompt) }, { signal: input.signal })
       if (!isRecord(result) || typeof result.text !== "string") throw new Error("OpenCode reviewer returned no text output")
       return JSON.parse(result.text)
     } finally {
@@ -205,6 +205,110 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       if (sessionID) await Promise.resolve(this.client.session.remove({ sessionID })).catch(() => undefined)
     }
   }
+}
+
+/**
+ * Reviewer client for the OpenCode 2.x server plugin context. The server
+ * domain cannot delete sessions, so one hidden reviewer session is kept per
+ * reviewer model and reused; `session.generate` is a one-shot call that does
+ * not grow the session. Sessions are created in the plugin's own location
+ * because a foreign location would start a second plugin instance.
+ */
+export interface ServerContextClientHooks {
+  /** Called before each reply is sent; the returned release runs if the reply fails. */
+  onReply?(requestID: string): () => void
+}
+
+export class ServerContextClient implements ReviewerClient {
+  private readonly sessions = new Map<string, string>()
+
+  constructor(
+    private readonly context: Pick<ServerPluginContext, "session" | "permission" | "location">,
+    private readonly hooks: ServerContextClientHooks = {},
+  ) {}
+
+  async generate(input: {
+    prompt: string
+    model: ReviewModel
+    parentSessionID: string
+    location?: { directory?: string; workspaceID?: string }
+    signal: AbortSignal
+  }): Promise<unknown> {
+    const key = `${input.model.providerID}/${input.model.id}/${input.model.variant ?? ""}`
+    let sessionID = this.sessions.get(key) ?? (await this.createSession(key, input.model, input.signal))
+    const abortRemote = () => {
+      void Promise.resolve(this.context.session.interrupt({ sessionID })).catch(() => undefined)
+    }
+    input.signal.addEventListener("abort", abortRemote, { once: true })
+    try {
+      if (input.signal.aborted) throw abortError(input.signal.reason)
+      const prompt = strictJsonPrompt(input.prompt)
+      let result: unknown
+      try {
+        result = await this.context.session.generate({ sessionID, prompt }, { signal: input.signal })
+      } catch (error) {
+        // A user may have deleted the reviewer session; recreate it once.
+        if (!isSessionNotFound(error)) throw error
+        this.sessions.delete(key)
+        sessionID = await this.createSession(key, input.model, input.signal)
+        result = await this.context.session.generate({ sessionID, prompt }, { signal: input.signal })
+      }
+      const value = unwrapData(result)
+      if (!isRecord(value) || typeof value.text !== "string") throw new Error("OpenCode reviewer returned no text output")
+      return JSON.parse(value.text)
+    } finally {
+      input.signal.removeEventListener("abort", abortRemote)
+    }
+  }
+
+  async reply(input: {
+    sessionID: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+    message?: string
+    protocol: "stable" | "v2"
+  }): Promise<"replied" | "not_found"> {
+    const release = this.hooks.onReply?.(input.requestID)
+    try {
+      await this.context.permission.reply({
+        sessionID: input.sessionID,
+        requestID: input.requestID,
+        decision: input.reply,
+        ...(input.message ? { message: input.message } : {}),
+      })
+      return "replied"
+    } catch (error) {
+      release?.()
+      if (isNotFound(error)) return "not_found"
+      throw error
+    }
+  }
+
+  private async createSession(key: string, model: ReviewModel, signal: AbortSignal): Promise<string> {
+    const created = unwrapData(await this.context.session.create({
+      title: REVIEWER_SESSION_TITLE,
+      agent: REVIEWER_AGENT_ID,
+      model: { providerID: model.providerID, id: model.id, ...(model.variant ? { variant: model.variant } : {}) },
+      location: this.context.location,
+      metadata: { source: "opencode-auto-permissions" },
+    }, { signal }))
+    if (!isRecord(created) || typeof created.id !== "string") {
+      throw new Error("OpenCode failed to create a reviewer session")
+    }
+    this.sessions.set(key, created.id)
+    return created.id
+  }
+}
+
+function strictJsonPrompt(prompt: string): string {
+  return `${prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
+}
+
+function isSessionNotFound(error: unknown): boolean {
+  if (!isRecord(error)) return false
+  const tag = error._tag ?? error.name
+  if (tag === "SessionNotFoundError" || tag === "Session.NotFoundError") return true
+  return typeof error.message === "string" && /session not found/i.test(error.message)
 }
 
 function assistantStructured(value: unknown): unknown {
@@ -256,7 +360,8 @@ function isNotFound(error: unknown): boolean {
   const status = error.status ?? Reflect.get(error, "statusCode")
   if (status === 404) return true
   const tag = error._tag ?? error.name
-  return tag === "PermissionNotFoundError" || tag === "Permission.NotFoundError"
+  if (tag === "PermissionNotFoundError" || tag === "Permission.NotFoundError") return true
+  return typeof error.message === "string" && /permission request not found/i.test(error.message)
 }
 
 function abortError(reason: unknown): Error {

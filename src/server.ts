@@ -1,11 +1,20 @@
 import { Plugin as V2Plugin } from "@opencode-ai/plugin"
-import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
+import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT, SERVER_PLUGIN_ID } from "./agent.ts"
 import { parseConfig } from "./config.ts"
+import { writeDiagnostic } from "./diagnostics.ts"
+import { ServerContextClient } from "./opencode-client.ts"
 import { installReviewer } from "./reviewer.ts"
+import {
+  canOwnServerReview,
+  createServerRuntime,
+  serverReviewCapabilities,
+  type ServerPluginContext,
+} from "./server-runtime.ts"
 import { createStableRuntime, protocolForVersion } from "./stable.ts"
+import { PLUGIN_VERSION } from "./version.ts"
 
 const v2Plugin = V2Plugin.define({
-  id: "opencode.auto-permissions.server",
+  id: SERVER_PLUGIN_ID,
   async setup(context) {
     const config = parseConfig(context.options)
     await context.agent.transform((draft) => {
@@ -19,8 +28,36 @@ const v2Plugin = V2Plugin.define({
         agent.permissions = [{ action: "*", resource: "*", effect: "deny" }]
       })
     })
+    return installServerReviewer(context as unknown as ServerPluginContext)
   },
 })
+
+/**
+ * On released 2.x runtimes the server owns V2 permission review, so web,
+ * headless and TUI sessions are all covered. Older betas lack the server
+ * surfaces, and there the TUI adapter keeps ownership.
+ */
+export function installServerReviewer(context: ServerPluginContext): (() => void) | undefined {
+  const config = parseConfig(context.options)
+  const capabilities = serverReviewCapabilities(context)
+  const owns = canOwnServerReview(capabilities, context.app?.version)
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    event: "plugin_environment",
+    version: PLUGIN_VERSION,
+    owner: owns ? "server" : "tui",
+    serverCapabilities: capabilities,
+    ...(context.app?.version ? { runtimeVersion: context.app.version } : {}),
+  })
+  if (!owns) return undefined
+  const { runtime, expectOwnReply, dispose } = createServerRuntime(context)
+  const client = new ServerContextClient(context, { onReply: expectOwnReply })
+  const stop = installReviewer(runtime, { client, protocols: ["v2"] })
+  return () => {
+    stop()
+    dispose()
+  }
+}
 
 /**
  * Structural types for the stable v1 server plugin API. The current plugin

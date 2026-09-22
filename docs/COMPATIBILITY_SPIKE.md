@@ -94,3 +94,42 @@ target sub-1.5-second P95 UX.
   still running the prompt is delivered with `delivery: "steer"` so the
   feedback lands mid-turn; once idle it is admitted with `resume: true`.
   Resume outcomes are recorded as `resumed`/`resume_failed` diagnostics.
+
+## OpenCode 2.0.12 Server-Side Review
+
+Verified on 22 September 2026 against OpenCode `2.0.12` (installer build; no
+matching npm or GitHub release tag exists) with a headless `opencode serve`
+and the plugin registered as `"plugin": ["file:/path/to/checkout"]`.
+
+- The server plugin `Context` exposes `event.subscribe`, `permission.list`,
+  `permission.get`, `permission.reply`, `permission.hook`, and a `session`
+  domain with `create`, `get`, `context`, `generate`, `interrupt`, `prompt`,
+  `wait`, `update`, `move`, `switchAgent`, `switchModel`, `command`, and
+  `synthetic`. It has no `session.remove`, `status`, or `active`.
+- `permission.reply` requires a `decision` field; `reply` is rejected with
+  "Missing key at decision". The published SDK types still say `reply`.
+- The server instantiates the plugin once per project directory, and the event
+  stream is shared across instances. Two instances saw the same
+  `permission.asked`; the second reply failed with "Permission request not
+  found". Creating a reviewer session under `/tmp` is what spawned the second
+  instance. The server runtime therefore filters events by
+  `location.directory` and creates reviewer sessions in its own location.
+- The server observes its own `permission.replied` event before the reply call
+  returns. Without suppression every review logged a spurious
+  `request_cancelled`; the runtime now skips the one reply it sent itself.
+- `session.generate` returns `{ text }` and does not grow the session, so one
+  hidden reviewer session per reviewer model is reused instead of the
+  create-then-delete pattern the TUI adapter uses.
+- `session.execution.started` and `session.execution.succeeded` events report
+  agent activity; no `session.status` or `session.idle` events were observed.
+  The runtime tracks running sessions from these and steers continuations into
+  running sessions, queueing otherwise.
+- OpenCode's free-tier provider (`opencode/mimo-v2.6-flash-free`) serves the
+  `build` and `general` agents but refuses the hidden reviewer agent with
+  "OpenCode's free tier can only be used from within OpenCode". Reviewer model
+  calls need a configured provider.
+- Plugins load lazily on the first request for a directory. A permission raised
+  before the plugin subscribes is not reviewed.
+- The legacy `[path, options]` plugin tuple with a bare directory path is not
+  listed or loaded; the `file:` specifier form (plain or as the tuple's first
+  element) is.

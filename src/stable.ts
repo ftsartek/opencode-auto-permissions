@@ -202,6 +202,12 @@ export function protocolForVersion(version: string | undefined): "stable" | "v2"
   return major >= 2 ? "v2" : "stable"
 }
 
+/** True for released 2.x builds (not 0.0.0-beta or -next), where the server plugin owns V2 review. */
+export function releasedV2Runtime(version: string | undefined): boolean {
+  if (!version || version.startsWith("0.0.0-")) return false
+  return protocolForVersion(version) === "v2"
+}
+
 function compatibleClient(value: any): any {
   if (isRecord(value)) return value
   throw new Error("OpenCode compatible authenticated client is unavailable")

@@ -1,10 +1,11 @@
 import { Plugin } from "@opencode-ai/plugin/tui"
 import type { Context } from "@opencode-ai/plugin/tui/plugin"
-import { AUTO_PERMISSIONS_MESSAGE_PREFIX } from "./context.ts"
+import { SERVER_PLUGIN_ID } from "./agent.ts"
+import { denialContinuation } from "./context.ts"
 import { parseConfig } from "./config.ts"
 import { describeError, writeDiagnostic } from "./diagnostics.ts"
 import { installReviewer } from "./reviewer.ts"
-import { protocolForVersion } from "./stable.ts"
+import { protocolForVersion, releasedV2Runtime } from "./stable.ts"
 import type { RuntimeContext } from "./types.ts"
 import { PLUGIN_VERSION } from "./version.ts"
 
@@ -12,10 +13,40 @@ export const id = "opencode.auto-permissions"
 
 const plugin = Plugin.define({
   id,
-  setup(context) {
+  async setup(context) {
+    if (await serverOwnsReview(context.client)) {
+      writeDiagnostic(parseConfig(context.options).diagnosticsPath, {
+        timestamp: new Date().toISOString(),
+        event: "ownership_deferred",
+        version: PLUGIN_VERSION,
+        owner: "server",
+      })
+      return () => {}
+    }
     return installReviewer(fromContext(context), { protocols: ["v2"] })
   },
 })
+
+/**
+ * On released 2.x runtimes the server plugin reviews V2 permissions for every
+ * client, so the TUI stands down when it can see that plugin active. Any
+ * failure to look leaves ownership with the TUI: there must never be no
+ * reviewer.
+ */
+async function serverOwnsReview(client: unknown): Promise<boolean> {
+  const value = client as { plugin?: { list?: (input?: unknown) => Promise<unknown> } }
+  if (typeof value?.plugin?.list !== "function") return false
+  try {
+    if (!releasedV2Runtime(await runtimeVersion(client))) return false
+    const plugins = unwrap(await value.plugin.list.call(value.plugin))
+    if (!Array.isArray(plugins)) return false
+    return plugins.some((entry) =>
+      isRecord(entry) && entry.id === SERVER_PLUGIN_ID && isRecord(entry.state) && entry.state.status === "active",
+    )
+  } catch {
+    return false
+  }
+}
 
 /**
  * Minimal structural type for the transitional TUI plugin API used by older
@@ -118,7 +149,7 @@ async function resumeV2Session(context: Context, sessionID: string, reason: stri
     session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> }
     v2?: { session?: { prompt?: (input: Record<string, unknown>) => Promise<unknown> } }
   }
-  const text = continuation(reason)
+  const text = denialContinuation(reason)
   const running = isRunning(context, sessionID)
   const flatPrompt = client?.session?.prompt
   const legacyPrompt = client?.v2?.session?.prompt
@@ -186,11 +217,15 @@ function isRunning(context: Context, sessionID: string): boolean {
   return typeof status === "function" ? status.call(context.data.session, sessionID) === "running" : false
 }
 
-function continuation(reason: string): string {
-  return `${AUTO_PERMISSIONS_MESSAGE_PREFIX} ${reason} Do not retry the exact blocked action. Continue the task using a safer alternative when possible; ask the user only if no useful safe path remains.`
+async function isStableRuntime(client: unknown): Promise<boolean> {
+  try {
+    return protocolForVersion(await runtimeVersion(client)) === "stable"
+  } catch {
+    return false
+  }
 }
 
-async function isStableRuntime(client: unknown): Promise<boolean> {
+async function runtimeVersion(client: unknown): Promise<string | undefined> {
   const value = client as {
     health?: { get?: () => Promise<unknown> }
     global?: { health?: () => Promise<unknown> }
@@ -200,13 +235,13 @@ async function isStableRuntime(client: unknown): Promise<boolean> {
     : typeof value?.global?.health === "function"
       ? value.global.health
       : undefined
-  if (!health) return false
-  try {
-    const result = unwrap(await health.call(value.health ?? value.global))
-    return protocolForVersion((result as { version?: string })?.version) === "stable"
-  } catch {
-    return false
-  }
+  if (!health) return undefined
+  const result = unwrap(await health.call(value.health ?? value.global))
+  return (result as { version?: string })?.version
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function unwrap(result: unknown): unknown {
@@ -281,7 +316,7 @@ async function resumeLegacySession(api: LegacyTuiApi, sessionID: string, reason:
     if (typeof client?.v2?.session?.prompt === "function") {
       await client.v2!.session!.prompt!({
         sessionID,
-        prompt: { text: continuation(reason) },
+        prompt: { text: denialContinuation(reason) },
         delivery: "queue",
         resume: true,
       })
@@ -291,7 +326,7 @@ async function resumeLegacySession(api: LegacyTuiApi, sessionID: string, reason:
       typeof client?.session?.prompt === "function" &&
       typeof client?.permission?.request?.list === "function"
     ) {
-      await client.session!.prompt!({ sessionID, text: continuation(reason), resume: true })
+      await client.session!.prompt!({ sessionID, text: denialContinuation(reason), resume: true })
     }
   } catch {
     // Resuming is best effort; the rejection itself already failed closed.

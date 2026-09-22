@@ -4,7 +4,9 @@ The plugin detects the runtime protocol automatically. Users do not choose a
 V1 or V2 mode:
 
 - stable OpenCode permission events are handled by the server adapter;
-- V2 permission events are handled by the TUI adapter.
+- V2 permission events on released 2.x builds are handled by the server
+  adapter, so web and headless sessions are reviewed without a TUI;
+- V2 permission events on 2.x betas are handled by the TUI adapter.
 
 The commands below choose which OpenCode executable to launch for testing;
 they do not configure the plugin's runtime behavior.
@@ -100,3 +102,47 @@ To verify isolation and server startup without opening a TUI:
 bun run scripts/test-runtime.ts stable --headless
 bun run scripts/test-runtime.ts v2 --headless
 ```
+
+## Headless OpenCode 2.x Check
+
+The runtime launchers above target stable 1.x and the pinned V2 beta. To
+exercise server-side review on a released 2.x build without a TUI, start an
+isolated server by hand. Replace `/path/to/checkout` with this repository.
+
+```bash
+ROOT=$(mktemp -d)
+mkdir -p "$ROOT/config/opencode" "$ROOT/data" "$ROOT/state" "$ROOT/cache"
+cat > "$ROOT/config/opencode/opencode.json" <<'JSON'
+{
+  "plugin": [["file:/path/to/checkout", { "debug": true }]],
+  "permissions": [{ "action": "shell", "resource": "*", "effect": "ask" }]
+}
+JSON
+export XDG_CONFIG_HOME="$ROOT/config" XDG_DATA_HOME="$ROOT/data" \
+  XDG_STATE_HOME="$ROOT/state" XDG_CACHE_HOME="$ROOT/cache" \
+  OPENCODE_SERVER_PASSWORD=testpass
+opencode serve --hostname 127.0.0.1 --port 4096 &
+```
+
+The server uses HTTP basic auth with user `opencode` and the password above.
+Requests take a `directory` query parameter naming the project. Plugins load
+lazily on the first request for a directory, so call the plugin list first and
+wait a few seconds before raising permissions:
+
+```bash
+AUTH=opencode:testpass; URL=http://127.0.0.1:4096; DIR=/path/to/checkout
+curl -s -u $AUTH "$URL/api/plugin?directory=$DIR" | grep -o '"opencode.auto-permissions.server"[^}]*}'
+SID=$(curl -s -u $AUTH -X POST "$URL/api/session?directory=$DIR" \
+  -H 'content-type: application/json' -d '{"title":"check"}' | sed 's/.*"id":"\([^"]*\)".*/\1/')
+curl -s -u $AUTH -X POST "$URL/api/session/$SID/permission?directory=$DIR" \
+  -H 'content-type: application/json' \
+  -d '{"action":"shell","resources":["git status --short"],"save":[],"agent":"build"}'
+```
+
+Expected: the plugin entry reports `"status":"active"`, and
+`$ROOT/state/opencode/auto-permissions/decisions.jsonl` contains a
+`plugin_environment` record with `"owner":"server"` followed by a `decision`
+record for the request. A synthetic prompt (`POST /api/session/{id}/synthetic`)
+that asks the agent to run a shell command exercises the tool-sourced path.
+OpenCode's free-tier models refuse the hidden reviewer agent, so the model
+path needs a configured provider; the policy path needs none.

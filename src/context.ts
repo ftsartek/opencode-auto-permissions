@@ -3,6 +3,10 @@ import type { PermissionRequest, ReviewInput, ReviewModel, RuntimeContext } from
 const MAX_MESSAGE_CHARS = 4_000
 export const AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:"
 
+export function denialContinuation(reason: string): string {
+  return `${AUTO_PERMISSIONS_MESSAGE_PREFIX} ${reason} Do not retry the exact blocked action. Continue the task using a safer alternative when possible; ask the user only if no useful safe path remains.`
+}
+
 export function normalizeAskedEvent(event: unknown): PermissionRequest | null {
   if (!isRecord(event)) return null
   const data = payload(event)

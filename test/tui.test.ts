@@ -242,3 +242,67 @@ describe("TUI plugin denial continuation", () => {
     expect(continuation).toContain("[Auto Permissions] The requested action was blocked:")
   })
 })
+
+describe("TUI plugin ownership handoff", () => {
+  function handoffContext(version: string, plugins: () => Promise<unknown>) {
+    const subscriptions: string[] = []
+    const context = {
+      options: {},
+      client: {
+        global: { health: async () => ({ data: { healthy: true, version } }) },
+        plugin: { list: plugins },
+      },
+      data: {
+        on(type: string) {
+          subscriptions.push(type)
+          return () => {}
+        },
+        session: {
+          root: (id: string) => id,
+          get: (id: string) => ({ id }),
+          message: { list: () => [], get: () => undefined, sync: async () => {} },
+          permission: { list: () => [], sync: async () => {} },
+        },
+      },
+      ui: { toast: { show() {} } },
+    } as unknown as Context
+    return { context, subscriptions }
+  }
+  const serverActive = async () => ({
+    data: [{ id: "opencode.auto-permissions.server", state: { status: "active" }, features: { server: true, tui: true } }],
+  })
+
+  test("stands down when the server plugin owns review on a released 2.x runtime", async () => {
+    const app = handoffContext("2.0.12", serverActive)
+
+    const dispose = await plugin.setup(app.context)
+
+    expect(app.subscriptions).toEqual([])
+    expect(typeof dispose).toBe("function")
+  })
+
+  test("keeps ownership on beta runtimes even when the server plugin is active", async () => {
+    const app = handoffContext("0.0.0-beta-202608110357", serverActive)
+
+    const dispose = await plugin.setup(app.context)
+
+    expect(app.subscriptions).toContain("permission.asked")
+    dispose?.()
+  })
+
+  test("keeps ownership when the server plugin is missing, failed, or unlistable", async () => {
+    const failed = handoffContext("2.0.12", async () => ({
+      data: [{ id: "opencode.auto-permissions.server", state: { status: "failed", error: "boom" } }],
+    }))
+    const absent = handoffContext("2.0.12", async () => ({ data: [] }))
+    const broken = handoffContext("2.0.12", async () => {
+      throw new Error("plugin list unavailable")
+    })
+
+    for (const app of [failed, absent, broken]) {
+      const dispose = await plugin.setup(app.context)
+      expect(app.subscriptions).toContain("permission.asked")
+      dispose?.()
+    }
+  })
+})

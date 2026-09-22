@@ -20,6 +20,8 @@ export interface DiagnosticRecord {
     | "failure"
     | "resumed"
     | "resume_failed"
+    | "ownership_deferred"
+    | "event_stream_restarted"
   requestID?: string
   sessionID?: string
   protocol?: PermissionRequest["protocol"]
@@ -46,6 +48,9 @@ export interface DiagnosticRecord {
   variant?: string
   attempt?: number
   clientCapabilities?: string[]
+  owner?: "server" | "tui"
+  serverCapabilities?: string[]
+  runtimeVersion?: string
 }
 
 export function defaultDiagnosticsPath(): string {
