@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-108%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-109%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -86,6 +86,7 @@ For each supported permission request, Auto Permissions combines deterministic s
 - If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step.
 - Reviewer sessions are hidden, have no tools, and deny all permissions.
 - Only a small, recent window of relevant user context is sent for review.
+- Answered multiple-choice questions from the primary agent are included in that window as question-and-answer pairs: the selected answer is treated as human input, while the question text is treated as agent-authored context rather than a human instruction.
 - Plugin-authored denial continuations are excluded from that context so an earlier verdict cannot become a self-reinforcing human instruction.
 
 The reviewer never receives authority to execute the requested action. It always resolves the request by approving once, approving narrow matching requests for the current session, or rejecting with an actionable reason. Session approvals are held in memory by OpenCode and do not persist to later sessions.
@@ -128,7 +129,7 @@ The plugin tuple accepts these options:
 | `variant` | Selected model's default | Optional reviewer-only model variant. Use `"low"` when supported for faster decisions. |
 | `sessionApprovals` | `true` | Reuse guarded, pattern-specific approvals immediately for the current session. Set `false` for one-time approvals only. |
 | `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
-| `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
+| `userMessageCount` | `8` | Recent conversation entries (user messages and answered questions) included in review context, from 1 to 20. |
 | `shadow` | `false` | Evaluate and record decisions without replying to permission requests. |
 | `runtime` | `"auto"` | Diagnostics override: `"auto"`, `"stable"`, or `"v2"`. Leave this on `"auto"` in normal use. |
 | `debug` | `false` | Write the latest 100 privacy-minimized outcomes to a JSONL file. Use `true` for the default path or provide a file path. |

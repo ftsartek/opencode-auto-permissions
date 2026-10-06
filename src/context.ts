@@ -1,4 +1,4 @@
-import type { PermissionRequest, ReviewInput, ReviewModel, RuntimeContext } from "./types.ts"
+import type { ConversationEntry, PermissionRequest, ReviewInput, ReviewModel, RuntimeContext } from "./types.ts"
 
 const MAX_MESSAGE_CHARS = 4_000
 export const AUTO_PERMISSIONS_MESSAGE_PREFIX = "[Auto Permissions] The requested action was blocked:"
@@ -70,10 +70,11 @@ export async function collectReviewInput(
   const sessionMessages = request.sessionID === rootSessionID
     ? []
     : context.data.session.message.list(request.sessionID)
-  const userMessages = [...rootMessages, ...sessionMessages]
-    .flatMap((message) => {
+  const conversation = [...rootMessages, ...sessionMessages]
+    .flatMap((message): ConversationEntry[] => {
       const text = userText(message)
-      return text === undefined ? [] : [text.slice(0, MAX_MESSAGE_CHARS)]
+      if (text !== undefined) return [{ kind: "user_message", text: text.slice(0, MAX_MESSAGE_CHARS) }]
+      return questionEntries(message)
     })
     .slice(-userMessageCount)
   const currentDirectory = directory(context)
@@ -91,7 +92,7 @@ export async function collectReviewInput(
     context: {
       rootSessionID,
       ...(currentDirectory ? { directory: currentDirectory } : {}),
-      userMessages,
+      conversation,
       ...(model ? { model } : {}),
     },
   }
@@ -135,22 +136,45 @@ function findToolInput(
   callID: string,
 ): unknown {
   const message = context.data.session.message.get(sessionID, messageID)
-  if (!isRecord(message)) return undefined
+  const tool = toolParts(message).find((part) => part.id === callID || part.callID === callID)
+  return isRecord(tool?.state) ? tool.state.input : undefined
+}
 
-  if (message.type === "assistant" && Array.isArray(message.content)) {
-    const tool = message.content.find(
-      (item) => isRecord(item) && item.type === "tool" && (item.id === callID || item.callID === callID),
-    )
-    if (isRecord(tool) && isRecord(tool.state)) return tool.state.input
-  }
+function toolParts(message: unknown): Record<string, any>[] {
+  if (!isRecord(message)) return []
+  const parts =
+    message.type === "assistant" && Array.isArray(message.content)
+      ? message.content
+      : isRecord(message.info) && message.info.role === "assistant" && Array.isArray(message.parts)
+        ? message.parts
+        : []
+  return parts.filter((part): part is Record<string, any> => isRecord(part) && part.type === "tool")
+}
 
-  if (isRecord(message.info) && message.info.role === "assistant" && Array.isArray(message.parts)) {
-    const tool = message.parts.find(
-      (part) => isRecord(part) && part.type === "tool" && (part.callID === callID || part.id === callID),
-    )
-    if (isRecord(tool) && isRecord(tool.state)) return tool.state.input
-  }
-  return undefined
+function questionEntries(message: unknown): ConversationEntry[] {
+  return toolParts(message).flatMap((part) => {
+    if (part.tool !== "question" || !isRecord(part.state) || part.state.status !== "completed") return []
+    const questions = isRecord(part.state.input) && Array.isArray(part.state.input.questions)
+      ? part.state.input.questions
+      : []
+    const answers = isRecord(part.state.metadata) && Array.isArray(part.state.metadata.answers)
+      ? part.state.metadata.answers
+      : []
+    return questions.flatMap((item, index): ConversationEntry[] => {
+      if (!isRecord(item) || typeof item.question !== "string") return []
+      const selected = Array.isArray(answers[index])
+        ? answers[index].filter((answer: unknown): answer is string => typeof answer === "string")
+        : []
+      if (selected.length === 0) return []
+      return [
+        {
+          kind: "question_answer",
+          question: item.question.slice(0, MAX_MESSAGE_CHARS),
+          answers: selected.map((answer) => answer.slice(0, MAX_MESSAGE_CHARS)),
+        },
+      ]
+    })
+  })
 }
 
 function directory(context: RuntimeContext): string | undefined {

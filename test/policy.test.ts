@@ -5,7 +5,7 @@ import type { ReviewInput } from "../src/types.ts"
 function input(command: string): ReviewInput {
   return {
     request: { action: "shell", resources: [command], sessionPatterns: [], toolInput: { command } },
-    context: { rootSessionID: "ses_root", userMessages: [] },
+    context: { rootSessionID: "ses_root", conversation: [] },
   }
 }
 
@@ -19,7 +19,7 @@ describe("applyDeterministicPolicy", () => {
     expect(
       applyDeterministicPolicy({
         request: { action: "external_directory", resources: ["/home/user/.ssh/*"], sessionPatterns: [] },
-        context: { rootSessionID: "ses_root", userMessages: [] },
+        context: { rootSessionID: "ses_root", conversation: [] },
       }),
     ).toBeNull()
   })
@@ -33,7 +33,7 @@ describe("applyDeterministicPolicy", () => {
           sessionPatterns: [],
           toolInput: { filePath: "/home/user/.local/state/opencode/auto-permissions/decisions.jsonl" },
         },
-        context: { rootSessionID: "ses_root", userMessages: [] },
+        context: { rootSessionID: "ses_root", conversation: [] },
       })?.reasonCode,
     ).toBe("own_diagnostics_access")
   })
@@ -46,7 +46,7 @@ describe("applyDeterministicPolicy", () => {
           resources: ["/home/user/.local/state/opencode/auto-permissions/*"],
           sessionPatterns: [],
         },
-        context: { rootSessionID: "ses_root", userMessages: [] },
+        context: { rootSessionID: "ses_root", conversation: [] },
       })?.reasonCode,
     ).toBe("own_diagnostics_access")
   })
@@ -70,8 +70,19 @@ describe("applyDeterministicPolicy", () => {
 
   test("denies a command the latest human message explicitly prohibits", () => {
     const value = input("touch /tmp/example")
-    value.context.userMessages = ["Run `touch /tmp/example`, but I explicitly prohibit that command from executing."]
+    value.context.conversation = [
+      { kind: "user_message", text: "Run `touch /tmp/example`, but I explicitly prohibit that command from executing." },
+    ]
     expect(applyDeterministicPolicy(value)?.reasonCode).toBe("explicit_user_prohibition")
+  })
+
+  test("defers to the model when a question answer follows the prohibition", () => {
+    const value = input("touch /tmp/example")
+    value.context.conversation = [
+      { kind: "user_message", text: "Run `touch /tmp/example`, but I explicitly prohibit that command from executing." },
+      { kind: "question_answer", question: "Should I create the file anyway?", answers: ["Yes, go ahead"] },
+    ]
+    expect(applyDeterministicPolicy(value)).toBeNull()
   })
 
   test("denies a matching external boundary the latest human message explicitly prohibits", () => {
@@ -80,7 +91,7 @@ describe("applyDeterministicPolicy", () => {
         request: { action: "external_directory", resources: ["/tmp/*"], sessionPatterns: [] },
         context: {
           rootSessionID: "ses_root",
-          userMessages: ["Do not execute `touch /tmp/example`."],
+          conversation: [{ kind: "user_message", text: "Do not execute `touch /tmp/example`." }],
         },
       })?.reasonCode,
     ).toBe("explicit_user_prohibition")

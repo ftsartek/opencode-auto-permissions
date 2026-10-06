@@ -51,7 +51,10 @@ function isOwnDiagnosticsAccess(input: ReviewInput): boolean {
 }
 
 function explicitlyProhibited(input: ReviewInput): boolean {
-  const message = input.context.userMessages.at(-1)
+  // Only a prohibition in the latest typed user message denies deterministically; a
+  // trailing question answer may supersede it, so that case defers to the model.
+  const latest = input.context.conversation.at(-1)
+  const message = latest?.kind === "user_message" ? latest.text : undefined
   if (!message || !/\b(?:explicitly prohibit|do not (?:run|execute|use|access)|must not (?:run|execute|use|access))\b/i.test(message)) {
     return false
   }

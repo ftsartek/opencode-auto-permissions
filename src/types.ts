@@ -24,6 +24,10 @@ export type Decision =
   | { kind: "allow_session"; reasonCode: string; reason: string }
   | { kind: "deny"; reasonCode: string; reason: string }
 
+export type ConversationEntry =
+  | { kind: "user_message"; text: string }
+  | { kind: "question_answer"; question: string; answers: string[] }
+
 export interface ReviewInput {
   request: {
     action: string
@@ -34,7 +38,7 @@ export interface ReviewInput {
   context: {
     rootSessionID: string
     directory?: string
-    userMessages: string[]
+    conversation: ConversationEntry[]
     model?: ReviewModel
   }
 }
