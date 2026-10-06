@@ -20,6 +20,7 @@ export interface DiagnosticRecord {
     | "failure"
     | "resumed"
     | "resume_failed"
+    | "abstained"
   requestID?: string
   sessionID?: string
   protocol?: PermissionRequest["protocol"]

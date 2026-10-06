@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { applyDeterministicPolicy } from "../src/policy.ts"
 import type { ReviewInput } from "../src/types.ts"
 
-function input(command: string): ReviewInput {
+function input(command: string, agentMode: ReviewInput["context"]["agentMode"] = "edit"): ReviewInput {
   return {
     request: { action: "shell", resources: [command], sessionPatterns: [], toolInput: { command } },
-    context: { rootSessionID: "ses_root", userMessages: [] },
+    context: { rootSessionID: "ses_root", userMessages: [], agentMode },
   }
 }
 
@@ -19,23 +19,24 @@ describe("applyDeterministicPolicy", () => {
     expect(
       applyDeterministicPolicy({
         request: { action: "external_directory", resources: ["/home/user/.ssh/*"], sessionPatterns: [] },
-        context: { rootSessionID: "ses_root", userMessages: [] },
+        context: { rootSessionID: "ses_root", userMessages: [], agentMode: "edit" },
       }),
     ).toBeNull()
   })
 
   test("allows access to its own bounded diagnostics file", () => {
-    expect(
-      applyDeterministicPolicy({
-        request: {
-          action: "external_directory",
-          resources: ["/home/user/.local/state/opencode/auto-permissions/*"],
-          sessionPatterns: [],
-          toolInput: { filePath: "/home/user/.local/state/opencode/auto-permissions/decisions.jsonl" },
-        },
-        context: { rootSessionID: "ses_root", userMessages: [] },
-      })?.reasonCode,
-    ).toBe("own_diagnostics_access")
+    const value: ReviewInput = {
+      request: {
+        action: "external_directory",
+        resources: ["/home/user/.local/state/opencode/auto-permissions/*"],
+        sessionPatterns: [],
+        toolInput: { filePath: "/home/user/.local/state/opencode/auto-permissions/decisions.jsonl" },
+      },
+      context: { rootSessionID: "ses_root", userMessages: [], agentMode: "edit" },
+    }
+    expect(applyDeterministicPolicy(value)?.reasonCode).toBe("own_diagnostics_access")
+    value.context.agentMode = "plan"
+    expect(applyDeterministicPolicy(value)).toBeNull()
   })
 
   test("allows the stable diagnostics directory boundary without tool input", () => {
@@ -46,7 +47,7 @@ describe("applyDeterministicPolicy", () => {
           resources: ["/home/user/.local/state/opencode/auto-permissions/*"],
           sessionPatterns: [],
         },
-        context: { rootSessionID: "ses_root", userMessages: [] },
+        context: { rootSessionID: "ses_root", userMessages: [], agentMode: "edit" },
       })?.reasonCode,
     ).toBe("own_diagnostics_access")
   })
@@ -68,6 +69,13 @@ describe("applyDeterministicPolicy", () => {
     expect(applyDeterministicPolicy(input("touch /tmp/example"))).toBeNull()
   })
 
+  test("sends all plan-mode commands to the mode-aware reviewer", () => {
+    expect(applyDeterministicPolicy(input("git status", "plan"))).toBeNull()
+    expect(applyDeterministicPolicy(input("git diff --output=/tmp/result", "plan"))).toBeNull()
+    expect(applyDeterministicPolicy(input("pnpm test", "plan"))).toBeNull()
+    expect(applyDeterministicPolicy(input("cargo build", "plan"))).toBeNull()
+  })
+
   test("denies a command the latest human message explicitly prohibits", () => {
     const value = input("touch /tmp/example")
     value.context.userMessages = ["Run `touch /tmp/example`, but I explicitly prohibit that command from executing."]
@@ -81,6 +89,7 @@ describe("applyDeterministicPolicy", () => {
         context: {
           rootSessionID: "ses_root",
           userMessages: ["Do not execute `touch /tmp/example`."],
+          agentMode: "edit",
         },
       })?.reasonCode,
     ).toBe("explicit_user_prohibition")

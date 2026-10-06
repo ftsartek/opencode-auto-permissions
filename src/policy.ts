@@ -7,7 +7,7 @@ export function applyDeterministicPolicy(input: ReviewInput): Decision | null {
   if (explicitlyProhibited(input)) {
     return deny("explicit_user_prohibition", "The user explicitly prohibited this action.")
   }
-  if (action === "external_directory" && isOwnDiagnosticsAccess(input)) {
+  if (input.context.agentMode === "edit" && action === "external_directory" && isOwnDiagnosticsAccess(input)) {
     return {
       kind: "allow",
       reasonCode: "own_diagnostics_access",
@@ -25,7 +25,7 @@ export function applyDeterministicPolicy(input: ReviewInput): Decision | null {
     )
   }
 
-  if (!SHELL_COMPOSITION.test(command) && isRoutineLocalCommand(command)) {
+  if (input.context.agentMode === "edit" && !SHELL_COMPOSITION.test(command) && isRoutineLocalCommand(command)) {
     return {
       kind: "allow",
       reasonCode: "routine_local_command",

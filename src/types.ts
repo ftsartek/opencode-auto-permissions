@@ -36,6 +36,8 @@ export interface ReviewInput {
     directory?: string
     userMessages: string[]
     model?: ReviewModel
+    agent?: string
+    agentMode: "plan" | "edit"
   }
 }
 

@@ -59,6 +59,7 @@ export async function collectReviewInput(
   context: RuntimeContext,
   request: PermissionRequest,
   userMessageCount: number,
+  readOnlyAgents: readonly string[],
 ): Promise<ReviewInput> {
   const rootSessionID = await context.data.session.root(request.sessionID)
   await Promise.all([
@@ -78,6 +79,12 @@ export async function collectReviewInput(
     .slice(-userMessageCount)
   const currentDirectory = directory(context)
   const model = latestUserModel(sessionMessages) ?? latestUserModel(rootMessages)
+  const requestingMessages = request.sessionID === rootSessionID ? rootMessages : sessionMessages
+  const sourceMessage = request.source?.type === "tool"
+    ? context.data.session.message.get(request.sessionID, request.source.messageID)
+    : undefined
+  const agent = messageAgent(sourceMessage) ?? latestUserAgent(requestingMessages)
+  const agentMode = !agent || readOnlyAgents.includes(agent) ? "plan" : "edit"
 
   return {
     request: {
@@ -93,8 +100,29 @@ export async function collectReviewInput(
       ...(currentDirectory ? { directory: currentDirectory } : {}),
       userMessages,
       ...(model ? { model } : {}),
+      ...(agent ? { agent } : {}),
+      agentMode,
     },
   }
+}
+
+function latestUserAgent(messages: unknown[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (!isRecord(message)) continue
+    const info = isRecord(message.info) ? message.info : message
+    if (info.role !== "user") continue
+    const agent = messageAgent(message)
+    if (agent) return agent
+  }
+  return undefined
+}
+
+function messageAgent(message: unknown): string | undefined {
+  if (!isRecord(message)) return undefined
+  const info = isRecord(message.info) ? message.info : message
+  if (typeof info.agent === "string") return info.agent
+  return isRecord(info.run) && typeof info.run.agent === "string" ? info.run.agent : undefined
 }
 
 function latestUserModel(messages: unknown[]): ReviewModel | undefined {

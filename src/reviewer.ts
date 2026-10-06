@@ -24,6 +24,7 @@ export interface ReviewerOverrides {
   protocols?: PermissionProtocol[]
   onDecision?(request: PermissionRequest, decision: Decision, shadow: boolean): void
   onFailure?(request: PermissionRequest, error: unknown): void
+  onAbstain?(request: PermissionRequest): void
 }
 
 export function installReviewer(context: RuntimeContext, overrides: ReviewerOverrides = {}): () => void {
@@ -114,8 +115,14 @@ async function reviewAndReply(
   sessionApprovals: Set<string>,
   sharedReviewSignal: AbortSignal,
 ): Promise<void> {
-  const input = await collectReviewInput(context, request, config.userMessageCount)
+  const input = await collectReviewInput(context, request, config.userMessageCount, config.readOnlyAgents)
   if (parentSignal.aborted) return
+
+  if (!config.enableAutoReadOnly && input.context.agentMode === "plan") {
+    overrides.onAbstain?.(request)
+    writeAbstained(config, request, startedAt)
+    return
+  }
 
   const policyDecision = applyDeterministicPolicy(input)
   const approvalKey = reusableApprovalKey(config, request, input)
@@ -152,7 +159,7 @@ async function reviewAndReply(
   if (!pending || parentSignal.aborted) return
 
   if (decision.kind === "allow" || decision.kind === "allow_session") {
-    const reply = decision.kind === "allow_session" && eligibleForSessionApproval(config, request, input)
+    const reply = decision.kind === "allow_session" && eligibleForSessionApproval(config, request)
       ? "always"
       : "once"
     const result = await client.reply({
@@ -216,19 +223,11 @@ async function rejectAfterFailure(
 function eligibleForSessionApproval(
   config: Config,
   request: PermissionRequest,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): boolean {
   if (!config.sessionApprovals || request.always.length === 0) return false
   if (request.always.some((pattern) => isBroadPattern(pattern))) return false
   if ([...request.resources, ...request.always].some((value) => isSensitiveTarget(value))) return false
-  if (["read", "glob", "grep", "list", "lsp"].includes(request.action)) return true
-  if (request.action !== "shell" && request.action !== "bash") return false
-  const command = typeof input.request.toolInput === "object" && input.request.toolInput !== null
-    ? Reflect.get(input.request.toolInput, "command")
-    : input.request.resources.join(" && ")
-  if (typeof command !== "string") return false
-  return !isSensitiveTarget(command)
-    && !/\b(?:sudo|rm|rmdir|shred|git\s+(?:push|reset|clean|rebase)|npm\s+publish|pnpm\s+publish|yarn\s+npm\s+publish|deploy|terraform\s+apply|kubectl\s+(?:apply|delete)|curl\b[^\n|]*\|\s*(?:ba|z|k)?sh)\b/i.test(command)
+  return ["read", "glob", "grep", "list", "lsp"].includes(request.action)
 }
 
 function reusableApprovalKey(
@@ -236,7 +235,7 @@ function reusableApprovalKey(
   request: PermissionRequest,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): string | undefined {
-  if (!eligibleForSessionApproval(config, request, input)) return undefined
+  if (!eligibleForSessionApproval(config, request)) return undefined
   return JSON.stringify([input.context.rootSessionID, request.action, request.always])
 }
 
@@ -310,6 +309,19 @@ function writeFailure(config: Config, request: PermissionRequest, startedAt: num
     ...(described.tag ? { errorTag: described.tag } : {}),
     ...(described.code !== undefined ? { errorCode: described.code } : {}),
     ...(described.status !== undefined ? { errorStatus: described.status } : {}),
+  })
+}
+
+function writeAbstained(config: Config, request: PermissionRequest, startedAt: number): void {
+  writeDiagnostic(config.diagnosticsPath, {
+    timestamp: new Date().toISOString(),
+    requestID: request.id,
+    sessionID: request.sessionID,
+    protocol: request.protocol,
+    action: request.action,
+    resourceCount: request.resources.length,
+    elapsedMs: Math.round(performance.now() - startedAt),
+    event: "abstained",
   })
 }
 
